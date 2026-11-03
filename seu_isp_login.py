@@ -602,15 +602,15 @@ WIZARD_PROFILE_WLAN = """    {
 WIZARD_PROFILE_ISP = """    {
       "ssid": "SEU-ISP",          // 运营商宽带；没有的话这条可以删掉
       "isp_suffix": "%(suffix)s", %(comment)s
-      "account": "",
-      "password": "",             // 留空 = 用上面的 password
+      "account": "%(account)s",   %(account_comment)s
+      "password": "%(password)s", %(password_comment)s
       "note": "%(note)s"
     }"""
 
 WIZARD_CONFIG = """{
   // 本文件由首次运行向导生成，可以直接改；支持 // 注释
-  "account": "%(account)s",     // 一卡通
-  "password": "%(password)s",   // 密码（校园网 / 宽带同一个）
+  "account": "%(account)s",     // 一卡通（校园网用的那个）
+  "password": "%(password)s",   %(password_comment)s
   "profiles": [
 %(profiles)s
   ],
@@ -621,6 +621,15 @@ WIZARD_CONFIG = """{
   "log_file": "login.log"
 }
 """
+
+
+def _jesc(value: str) -> str:
+    """转义成能安全放进 JSON 字符串字面量的形式。
+
+    密码里出现 " 或 \\ 时直接拼进模板会把 config.json 写坏，
+    下次启动解析失败，而报错信息看起来跟密码无关，很难查。
+    """
+    return json.dumps(str(value), ensure_ascii=False)[1:-1]
 
 
 def has_credentials(cfg: dict) -> bool:
@@ -703,17 +712,32 @@ def first_run_wizard(force: bool = False) -> bool:
         return False  # 无窗口 exe / 计划任务里不提问
     print()
     print("=" * 64)
-    print(" 第一次运行，回答三个问题就能用了（直接回车 = 用方括号里的默认值）")
+    print(" 第一次运行，回答几个问题就能用了（直接回车 = 用方括号里的默认值）")
     print("=" * 64)
     try:
         account = ""
         while not account:
-            account = input(" 1/3 一卡通：").strip()
-        password = read_password(" 2/3 密码（校园网和宽带是同一个，输入时不显示）：").strip()
-        print(" 3/3 有没有运营商宽带（SEU-ISP）？")
+            account = input(" 1/4 一卡通（校园网用的那个）：").strip()
+        password = read_password(" 2/4 密码（输入时不显示）：").strip()
+        print(" 3/4 有没有运营商宽带（SEU-ISP）？")
         print("      1 = 中国移动    2 = 中国电信    3 = 中国联通")
         print("      直接回车 = 没有，只用校园网")
         choice = input("      [回车 = 没有]：").strip()
+        # 宽带和校园网是两个独立的账号体系，很多人密码（甚至一卡通号）都不一样。
+        # 以前这里默认「同一个」并写死留空，结果宽带那份回退到校园网密码，认证一直失败。
+        isp_account = account
+        isp_password = password
+        separate = False
+        if choice in CARRIERS:
+            print(" 4/4 宽带的账号密码和校园网一样吗？")
+            print("      1 = 一样（直接回车）    2 = 不一样，分别填")
+            answer = input("      [回车 = 一样]：").strip()
+            if answer == "2":
+                separate = True
+                isp_account = ""
+                while not isp_account:
+                    isp_account = input("      宽带一卡通：").strip()
+                isp_password = read_password("      宽带密码（输入时不显示）：").strip()
     except (EOFError, KeyboardInterrupt):
         print("\n 已取消。")
         return False
@@ -726,12 +750,29 @@ def first_run_wizard(force: bool = False) -> bool:
         suffix, carrier = CARRIERS["1"]
         isp_comment = "// 没有运营商宽带的话，这条可以不管或删掉"
         isp_note = "没有运营商宽带（可删）"
+
+    if separate:
+        isp_account_comment = "// 宽带专用账号"
+        isp_password_comment = "// 宽带专用密码"
+    else:
+        isp_account_comment = "// 留空 = 用上面的 account"
+        isp_password_comment = "// 留空 = 用上面的 password"
+
     profiles = WIZARD_PROFILE_WLAN + ",\n" + WIZARD_PROFILE_ISP % {
-        "suffix": suffix, "carrier": carrier, "comment": isp_comment, "note": isp_note,
+        "suffix": suffix,
+        "carrier": carrier,
+        "comment": isp_comment,
+        "note": isp_note,
+        # 一样时写空串（配置里留空即回退顶层），不一样时写实际值
+        "account": "" if not separate else _jesc(isp_account),
+        "password": "" if not separate else _jesc(isp_password),
+        "account_comment": isp_account_comment,
+        "password_comment": isp_password_comment,
     }
     text = WIZARD_CONFIG % {
-        "account": account,
-        "password": password,
+        "account": _jesc(account),
+        "password": _jesc(password),
+        "password_comment": "// 密码（校园网用的那个）",
         "profiles": profiles,
     }
     try:
@@ -741,7 +782,11 @@ def first_run_wizard(force: bool = False) -> bool:
         print(" 写配置文件失败：%s" % exc)
         return False
     print("\n 已保存配置：%s" % CONFIG_PATH)
-    print(" 提示：两个网络用的是同一个一卡通号和同一个密码，要改直接编辑 config.json。")
+    if separate:
+        print(" 已按「宽带与校园网账号密码不同」写入：SEU-ISP 那份填了专用账号密码。")
+    else:
+        print(" 已按「两个网络用同一个一卡通号和密码」写入。")
+    print(" 要改直接编辑 config.json（支持 // 注释）。")
     print(" 接下来自动试一次认证，结果会打印在下面。\n")
     return True
 
