@@ -6,7 +6,7 @@
 作用：开机 / 登录 Windows 后自动完成校园网认证，免去每次手动打开浏览器、输入一卡通号和密码、
       选择服务类型的步骤。账号和密码两个网络是同一个，写法按当前连的无线网络自动切换：
         SEU-WLAN → ",0,一卡通号"（无感知认证前缀，不带服务类型后缀）
-        SEU-ISP  → "一卡通号@cmcc"（中国电信 @dx、中国联通 @lt）
+        SEU-ISP  → "一卡通号@cmcc"（中国电信 @dx、中国联通 @unicom）
 
 原理：
   1. 直连探测认证门户（w.seu.edu.cn / 10.80.128.2 / 10.9.10.100，明确不走系统代理）
@@ -587,7 +587,7 @@ def nudge_wifi(cfg: dict, waited: float, last_nudge: list, ssids: list) -> None:
 CARRIERS = {
     "1": ("@cmcc", "中国移动"),
     "2": ("@dx", "中国电信"),
-    "3": ("@lt", "中国联通"),
+    "3": ("@unicom", "中国联通"),
 }
 
 WIZARD_PROFILE_WLAN = """    {
@@ -631,6 +631,72 @@ def has_credentials(cfg: dict) -> bool:
     return any(str(item.get("password") or "").strip() for item in (cfg.get("profiles") or []))
 
 
+def _stdin_is_tty() -> bool:
+    """判断 stdin 是不是真正的控制台。判断本身也不能抛异常。"""
+    try:
+        return bool(sys.stdin and sys.stdin.isatty())
+    except Exception:
+        return False
+
+
+def read_password(prompt: str) -> str:
+    """读密码，输入过程不回显。
+
+    三层降级，顺序很重要：
+
+    1. getpass.getpass()：真正的控制台里能隐藏输入。
+    2. msvcrt 逐键读取 + 打印 *：getpass 失败时的 Windows 专用兜底。
+    3. input()：最后才明文，并明确提示。
+
+    坑：getpass 在非 tty 环境下**不会抛异常**，而是去读 /dev/tty 并永久阻塞
+    （Windows 的 git-bash 管道里实测会卡死）。msvcrt.getwch() 在非控制台同样永久阻塞。
+    所以这两个分支都必须先用 isatty() 把关，否则程序会挂住而不是降级。
+    """
+    interactive = _stdin_is_tty()
+
+    if interactive:
+        try:
+            import getpass
+            return getpass.getpass(prompt)
+        except (KeyboardInterrupt, EOFError):
+            raise
+        except Exception:
+            pass
+
+        try:
+            import msvcrt
+            sys.stdout.write(prompt)
+            sys.stdout.flush()
+            chars = []
+            while True:
+                ch = msvcrt.getwch()
+                if ch in ("\r", "\n"):
+                    break
+                if ch == "\x03":  # Ctrl+C
+                    raise KeyboardInterrupt
+                if ch == "\x08":  # 退格
+                    if chars:
+                        chars.pop()
+                        sys.stdout.write("\b \b")
+                        sys.stdout.flush()
+                    continue
+                if ch in ("\x00", "\xe0"):  # 功能键前缀，吞掉第二个字节
+                    msvcrt.getwch()
+                    continue
+                chars.append(ch)
+                sys.stdout.write("*")
+                sys.stdout.flush()
+            sys.stdout.write("\n")
+            return "".join(chars)
+        except (KeyboardInterrupt, EOFError):
+            raise
+        except Exception:
+            pass
+
+    print("（注意：当前环境无法隐藏输入，密码会显示在屏幕上）")
+    return input(prompt)
+
+
 def first_run_wizard(force: bool = False) -> bool:
     """没有可用配置时，在控制台问几个问题并生成 config.json。"""
     if not force and not (sys.stdin and sys.stdout and sys.stdout.isatty()):
@@ -643,7 +709,7 @@ def first_run_wizard(force: bool = False) -> bool:
         account = ""
         while not account:
             account = input(" 1/3 一卡通：").strip()
-        password = input(" 2/3 密码（校园网和宽带是同一个）：").strip()
+        password = read_password(" 2/3 密码（校园网和宽带是同一个，输入时不显示）：").strip()
         print(" 3/3 有没有运营商宽带（SEU-ISP）？")
         print("      1 = 中国移动    2 = 中国电信    3 = 中国联通")
         print("      直接回车 = 没有，只用校园网")
@@ -654,7 +720,7 @@ def first_run_wizard(force: bool = False) -> bool:
 
     if choice in CARRIERS:
         suffix, carrier = CARRIERS[choice]
-        isp_comment = "// 移动 @cmcc / 电信 @dx / 联通 @lt"
+        isp_comment = "// 移动 @cmcc / 电信 @dx / 联通 @unicom"
         isp_note = "运营商宽带（%s）" % carrier
     else:
         suffix, carrier = CARRIERS["1"]
