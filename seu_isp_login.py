@@ -888,18 +888,39 @@ TASK_BOOT = "SEU-ISP-AutoLogin-Boot"
 TASK_LOGON = "SEU-ISP-AutoLogin"
 
 
-def run_text_utf8(command: list) -> str:
-    """同 run_text，但按 UTF-8 解码。PowerShell 的 ConvertTo-Json 输出用它。"""
+def run_text_utf8(command: list, with_stderr: bool = False) -> str:
+    """同 run_text，但按 UTF-8 解码。PowerShell 的 ConvertTo-Json 输出用它。
+
+    with_stderr=True 时把 stderr 一起返回（PowerShell 的失败信息写在 stderr，
+    只取 stdout 会让调用方拿到空串，看不到失败原因）。
+    """
     try:
         result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8",
                                 errors="replace", timeout=25, creationflags=NO_WINDOW_FLAG)
-        return result.stdout or ""
+        out = result.stdout or ""
+        if with_stderr:
+            err = (result.stderr or "").strip()
+            if err:
+                out = (out + "\n" + err).strip()
+        return out
     except Exception:
         return ""
 
 
+# task_state() 的查询结果：任务不存在 vs 查询本身失败，必须区分开。
+# 用同一个 None 表示两者时，cmd_uninstall 会把「查询失败」误判成「本来就没装」，
+# 进而打印「共删除 0 个任务」并让用户以为已经取消了自启。
+TASK_ABSENT = "absent"
+TASK_QUERY_FAILED = "query_failed"
+
+
 def task_state(name: str):
-    """查询一个计划任务的状态；不存在返回 None。
+    """查询一个计划任务的状态。
+
+    返回值：
+      dict            —— 查到了
+      TASK_ABSENT     —— 确认任务不存在
+      TASK_QUERY_FAILED —— 查询失败（powershell 缺失 / 超时 / 输出无法解析）
 
     用 Get-ScheduledTask + ConvertTo-Json 取结构化字段，避免解析本地化的 schtasks 文本输出。
     """
@@ -919,15 +940,17 @@ def task_state(name: str):
         "}|ConvertTo-Json -Compress" % (name, name)
     )
     out = run_text_utf8(["powershell", "-NoProfile", "-Command", script]).strip()
-    if not out or "NOTASK" in out:
-        return None
+    if "NOTASK" in out:
+        return TASK_ABSENT
+    if not out:
+        return TASK_QUERY_FAILED
     match = re.search(r"\{.*\}", out, re.S)
     if not match:
-        return None
+        return TASK_QUERY_FAILED
     try:
         return json.loads(match.group(0))
     except Exception:
-        return None
+        return TASK_QUERY_FAILED
 
 
 def fmt_time(value: str) -> str:
@@ -968,7 +991,9 @@ SCHED_BENIGN = {
 def describe_task(name: str, role: str) -> list:
     """把一个任务的状态渲染成若干行文本。"""
     info = task_state(name)
-    if info is None:
+    if info == TASK_QUERY_FAILED:
+        return ["  %-24s 查询失败（%s）—— 无法确认是否已安装" % (name, role)]
+    if info == TASK_ABSENT:
         return ["  %-24s 未安装（%s）" % (name, role)]
     state = info.get("State") or "?"
     last_run = fmt_time(info.get("LastRun"))
@@ -1110,17 +1135,25 @@ def cmd_uninstall(cfg: dict, keep_popup: bool = False) -> int:
 
     removed = 0
     for name in (TASK_BOOT, TASK_LOGON):
-        if task_state(name) is None:
+        before = task_state(name)
+        if before == TASK_QUERY_FAILED:
+            print("  %-24s 查询失败，无法确认状态，跳过（请手动检查）" % name)
+            continue
+        if before == TASK_ABSENT:
             print("  %-24s 本来就没装，跳过" % name)
             continue
         out = run_text_utf8([
             "powershell", "-NoProfile", "-Command",
             "$ErrorActionPreference='Stop';"
             "Unregister-ScheduledTask -TaskName '%s' -Confirm:$false" % name,
-        ]).strip()
-        if task_state(name) is None:
+        ], with_stderr=True).strip()
+        after = task_state(name)
+        if after == TASK_ABSENT:
             print("  %-24s 已删除" % name)
             removed += 1
+        elif after == TASK_QUERY_FAILED:
+            print("  %-24s 删除后无法确认结果（查询失败）%s"
+                  % (name, ("：" + out) if out else ""))
         else:
             print("  %-24s 删除失败：%s" % (name, out or "未知原因"))
 
@@ -1187,10 +1220,11 @@ if __name__ == "__main__":
             wait_for_enter()
         sys.exit(code)
     if "--uninstall" in args:
+        was_admin = is_admin()
         code = cmd_uninstall(load_config(), keep_popup="--keep-popup" in args)
-        if "--pause" in args or not is_admin():
-            pass
-        else:
+        # 双击入口（6-取消开机自启.cmd）带 --pause；提权后的子进程是新窗口，
+        # 也停一下让用户看清结果。未提权时父进程立即返回，不能在这里等。
+        if "--pause" in args or (was_admin and code == 0):
             wait_for_enter()
         sys.exit(code)
     code = main(args)
