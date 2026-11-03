@@ -128,6 +128,17 @@ Python 3 标准库实现，无第三方依赖，已在 Windows 11 + SEU-ISP 上�
 （计划任务用，不闪黑框）。命令行等价写法：`seu-autologin.exe --once`、`seu-autologin.exe --init`。
 未签名的 exe 首次运行会弹 SmartScreen「未知发布者」，点「更多信息 → 仍要运行」即可。
 
+### 查看状态与取消开机自启
+
+双击 `5-查看状态.cmd` 一屏看完：配置里实际提交的账号、当前连的无线网络、外网通不通、
+两个计划任务装没装（含上次运行时间与返回码）、最近几条日志。
+
+双击 `6-取消开机自启.cmd` 删除两个计划任务（会请求管理员），默认顺带把 Windows 的
+联网验证弹窗恢复原样；不想动弹窗就命令行跑 `seu-autologin.exe --uninstall --keep-popup`。
+取消后手动认证仍可用：`seu-autologin.exe --once`。
+
+`seu-autologin.exe --help` 列出全部命令。
+
 ### 方式二：直接用 Python 脚本
 
 ```powershell
@@ -250,6 +261,8 @@ config.example.json     配置模板，复制成 config.json 后填自己的账�
 2-安装开机自启.cmd      注册计划任务（双击，会自动提权）
 3-关闭联网验证弹窗.cmd  关掉 Windows 的「登录到网络」弹窗（重装/重跑用）
 4-恢复联网验证弹窗.cmd  把上面那个弹窗恢复回来
+5-查看状态.cmd          查看状态：配置 / 网络 / 任务 / 最近日志
+6-取消开机自启.cmd      删除两个计划任务（双击，会自动提权）
 使用说明.txt            给不用命令行的人看的三步说明
 logout.py               把本机踢下线，用来测试自动登录
 install_tasks.ps1       注册两个计划任务（需管理员）

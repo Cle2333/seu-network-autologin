@@ -18,7 +18,10 @@
 
 配置：同目录 config.json（支持 // 注释）   日志：同目录 login.log
 手动运行：seu-autologin.exe --once       只试一次
+          seu-autologin.exe --status     查看状态（配置 / 网络 / 任务 / 最近日志）
+          seu-autologin.exe --uninstall  取消开机自启（删两个计划任务，需管理员）
           seu-autologin.exe --init       首次配置向导
+          seu-autologin.exe --help       列出全部命令
           seu-autologin.exe --pause      结束后停住等按键（给双击用）
 """
 
@@ -815,8 +818,315 @@ def scheduled_task_installed() -> bool:
     return "SEU-ISP-AutoLogin" in run_text(["schtasks", "/query", "/tn", "SEU-ISP-AutoLogin"])
 
 
+TASK_BOOT = "SEU-ISP-AutoLogin-Boot"
+TASK_LOGON = "SEU-ISP-AutoLogin"
+
+
+def run_text_utf8(command: list) -> str:
+    """同 run_text，但按 UTF-8 解码。PowerShell 的 ConvertTo-Json 输出用它。"""
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8",
+                                errors="replace", timeout=25, creationflags=NO_WINDOW_FLAG)
+        return result.stdout or ""
+    except Exception:
+        return ""
+
+
+def task_state(name: str):
+    """查询一个计划任务的状态；不存在返回 None。
+
+    用 Get-ScheduledTask + ConvertTo-Json 取结构化字段，避免解析本地化的 schtasks 文本输出。
+    """
+    script = (
+        "$ErrorActionPreference='SilentlyContinue';"
+        "[Console]::OutputEncoding=[Text.Encoding]::UTF8;"
+        "$t=Get-ScheduledTask -TaskName '%s';"
+        "if(-not $t){Write-Output 'NOTASK';exit};"
+        "$i=Get-ScheduledTaskInfo -TaskName '%s';"
+        "[pscustomobject]@{"
+        "State=[string]$t.State;"
+        "LastRun=[string]$i.LastRunTime;"
+        "LastResult=$i.LastTaskResult;"
+        "NextRun=[string]$i.NextRunTime;"
+        "RunAs=[string]$t.Principal.UserId;"
+        "Triggers=($t.Triggers | ForEach-Object { $_.CimClass.CimClassName }) -join ','"
+        "}|ConvertTo-Json -Compress" % (name, name)
+    )
+    out = run_text_utf8(["powershell", "-NoProfile", "-Command", script]).strip()
+    if not out or "NOTASK" in out:
+        return None
+    match = re.search(r"\{.*\}", out, re.S)
+    if not match:
+        return None
+    try:
+        return json.loads(match.group(0))
+    except Exception:
+        return None
+
+
+def fmt_time(value: str) -> str:
+    """把 PowerShell 的 DateTime 字符串收拾成好读的样子。"""
+    text = (value or "").strip()
+    # 任务从未运行时，LastRunTime 是 1999-11-30 这个占位值。
+    # 注意 PowerShell 按系统区域格式输出（本机是 11/30/1999 00:00:00，不是 ISO）。
+    if not text or text in ("(null)", ""):
+        return "从未运行"
+    if text.startswith("0001-01-01") or "1999-11-30" in text or "1999/11/30" in text:
+        return "从未运行"
+    try:
+        from datetime import datetime
+        for pattern in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S",
+                        "%m/%d/%Y %H:%M:%S", "%m/%d/%Y %H:%M"):
+            try:
+                parsed = datetime.strptime(text[:19], pattern)
+            except ValueError:
+                continue
+            if parsed.year <= 1999:
+                return "从未运行"
+            return parsed.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        pass
+    return text[:19]
+
+
+# 计划任务的「这不是错误」返回码
+SCHED_BENIGN = {
+    0x00041303: "任务从未运行过",
+    0x00041301: "任务正在运行",
+    0x00041302: "任务已被禁用",
+    0x00041306: "上次运行被用户终止",
+    0x00041307: "任务没有任何可运行的触发器",
+}
+
+
+def describe_task(name: str, role: str) -> list:
+    """把一个任务的状态渲染成若干行文本。"""
+    info = task_state(name)
+    if info is None:
+        return ["  %-24s 未安装（%s）" % (name, role)]
+    state = info.get("State") or "?"
+    last_run = fmt_time(info.get("LastRun"))
+    next_run = fmt_time(info.get("NextRun"))
+    code = info.get("LastResult")
+    run_as = info.get("RunAs") or "?"
+    lines = [
+        "  %-24s 已安装（%s）" % (name, role),
+        "      状态        %s" % state,
+        "      运行身份    %s" % run_as,
+        "      上次运行    %s" % last_run,
+        "      下次运行    %s" % next_run,
+    ]
+    if code is not None:
+        value = int(code) & 0xFFFFFFFF
+        if value in SCHED_BENIGN:
+            lines.append("      上次结果    0x%08X（%s）" % (value, SCHED_BENIGN[value]))
+        elif value == 0:
+            lines.append("      上次结果    0x00000000（成功）")
+        else:
+            lines.append("      上次结果    0x%08X（失败，看 login.log）" % value)
+    return lines
+
+
+def cmd_status(cfg: dict) -> int:
+    """--status：把「能不能用、现在什么情况、任务装没装」一次说清楚。"""
+    print()
+    print("=" * 68)
+    print(" SEU 校园网自动登录 —— 状态")
+    print("=" * 68)
+
+    # 1) 配置
+    print()
+    print("[ 配置 ]")
+    if cfg.get("_config_error"):
+        print("  读取 config.json 出错：%s" % cfg["_config_error"])
+    account = str(cfg.get("account") or "")
+    has_pwd = bool(str(cfg.get("password") or ""))
+    print("  配置文件      %s" % CONFIG_PATH)
+    print("  顶层账号      %s" % (account or "（空）"))
+    print("  顶层密码      %s" % ("已设置（不回显）" if has_pwd else "（空）"))
+    for item in cfg.get("profiles") or []:
+        ssid = item.get("ssid") or "?"
+        acc = item.get("account") or account or "（空）"
+        pwd = "profile 自带" if item.get("password") else ("用顶层" if has_pwd else "（空）")
+        prefix = item.get("account_prefix") or ""
+        suffix = item.get("isp_suffix")
+        suffix = cfg.get("isp_suffix", "") if suffix is None else suffix
+        print("    %-10s 提交为 %s%s%s   密码：%s"
+              % (ssid, prefix, acc, suffix or "", pwd))
+
+    # 2) 网络
+    print()
+    print("[ 网络 ]")
+    ssid = current_ssid(cfg)
+    ip = local_ip()
+    print("  当前无线网络  %s" % (ssid or "（未识别，将用顶层配置）"))
+    print("  本机 IP       %s" % (ip or "（取不到）"))
+    ok, detail = connectivity_ok(cfg, float(cfg.get("request_timeout_seconds", 4)))
+    print("  外网连通      %s（%s）" % ("是" if ok else "否", detail))
+
+    # 3) 计划任务
+    print()
+    print("[ 开机自启 ]")
+    for line in describe_task(TASK_BOOT, "开机时，SYSTEM，锁屏阶段也生效"):
+        print(line)
+    for line in describe_task(TASK_LOGON, "登录时 + 每 15 分钟 + 网络变化后"):
+        print(line)
+
+    # 4) 最近日志
+    print()
+    print("[ 最近日志 ]")
+    log_path = os.path.join(BASE_DIR, cfg.get("log_file") or "login.log")
+    try:
+        with open(log_path, "r", encoding="utf-8", errors="replace") as handle:
+            tail = handle.readlines()[-6:]
+        if tail:
+            for line in tail:
+                print("  " + line.rstrip())
+        else:
+            print("  （日志为空）")
+    except FileNotFoundError:
+        print("  （还没有 login.log，说明还没运行过）")
+    except Exception as exc:
+        print("  （读不了日志：%s）" % exc.__class__.__name__)
+
+    # 5) 残留锁
+    lock_path = os.path.join(BASE_DIR, cfg.get("lock_file") or "login.lock")
+    if os.path.exists(lock_path):
+        try:
+            age = int(time.time() - os.path.getmtime(lock_path))
+            print()
+            print("  注意：存在 login.lock（%d 秒前），若有实例卡死可删除" % age)
+        except OSError:
+            pass
+
+    print()
+    print("=" * 68)
+    return 0
+
+
+def is_admin() -> bool:
+    try:
+        import ctypes
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def relaunch_elevated(argv: list) -> int:
+    """以管理员身份重新启动自己（用于 --uninstall）。返回父进程的退出码。"""
+    exe = sys.executable or ""
+    if getattr(sys, "frozen", False):
+        target, params = exe, " ".join('"%s"' % a for a in argv)
+    else:
+        target = exe
+        params = " ".join('"%s"' % a for a in [os.path.abspath(__file__)] + argv)
+    try:
+        import ctypes
+        rc = ctypes.windll.shell32.ShellExecuteW(None, "runas", target, params, BASE_DIR, 1)
+        return 0 if rc > 32 else 1
+    except Exception as exc:
+        print("  提权失败：%s" % exc)
+        return 1
+
+
+def cmd_uninstall(cfg: dict, keep_popup: bool = False) -> int:
+    """--uninstall：删掉两个计划任务（需要管理员），可选恢复联网验证弹窗。"""
+    print()
+    print("=" * 68)
+    print(" SEU 校园网自动登录 —— 取消开机自启")
+    print("=" * 68)
+    print()
+
+    if not is_admin():
+        print("  需要管理员权限才能删除计划任务，正在请求提权……")
+        args = ["--uninstall"] + (["--keep-popup"] if keep_popup else [])
+        return relaunch_elevated(args)
+
+    removed = 0
+    for name in (TASK_BOOT, TASK_LOGON):
+        if task_state(name) is None:
+            print("  %-24s 本来就没装，跳过" % name)
+            continue
+        out = run_text_utf8([
+            "powershell", "-NoProfile", "-Command",
+            "$ErrorActionPreference='Stop';"
+            "Unregister-ScheduledTask -TaskName '%s' -Confirm:$false" % name,
+        ]).strip()
+        if task_state(name) is None:
+            print("  %-24s 已删除" % name)
+            removed += 1
+        else:
+            print("  %-24s 删除失败：%s" % (name, out or "未知原因"))
+
+    # 顺手清掉运行期残留
+    for leftover in (cfg.get("lock_file") or "login.lock",):
+        path = os.path.join(BASE_DIR, leftover)
+        if os.path.exists(path):
+            try:
+                os.remove(path)
+                print("  %-24s 已清理残留锁" % leftover)
+            except OSError:
+                pass
+
+    if keep_popup:
+        print()
+        print("  联网验证弹窗：按要求保留现状（未改动）")
+    else:
+        popup = os.path.join(BASE_DIR, "signin_popup.ps1")
+        if os.path.exists(popup):
+            print()
+            print("  恢复 Windows「登录到网络」弹窗……")
+            run_text_utf8([
+                "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                "-File", popup, "-Restore",
+            ])
+            print("  已尝试恢复（EnableActiveProbing=1）")
+        else:
+            print()
+            print("  未找到 signin_popup.ps1，跳过弹窗恢复")
+
+    print()
+    print("  共删除 %d 个任务。手动认证仍可用：seu-autologin.exe --once" % removed)
+    print("  想重新装回来：双击「2-安装开机自启.cmd」")
+    print("=" * 68)
+    return 0
+
+
+def cmd_help() -> int:
+    print()
+    print("SEU 校园网自动登录 —— 命令")
+    print()
+    print("  --once            试一次认证（最常用）")
+    print("  --status          查看状态：配置 / 网络 / 任务 / 最近日志")
+    print("  --uninstall       取消开机自启（删除两个计划任务，需管理员）")
+    print("  --keep-popup      配合 --uninstall：不动 Windows 联网验证弹窗")
+    print("  --init            重新跑首次配置向导（会覆盖 config.json）")
+    print("  --pause           结束后停住等按键（给双击用）")
+    print()
+    print("  不带参数：正常认证流程（计划任务就是这么调用的）")
+    print()
+    return 0
+
+
 if __name__ == "__main__":
     args = sys.argv[1:]
+    if "--help" in args or "-h" in args:
+        code = cmd_help()
+        if "--pause" in args:
+            wait_for_enter()
+        sys.exit(code)
+    if "--status" in args:
+        code = cmd_status(load_config())
+        if "--pause" in args:
+            wait_for_enter()
+        sys.exit(code)
+    if "--uninstall" in args:
+        code = cmd_uninstall(load_config(), keep_popup="--keep-popup" in args)
+        if "--pause" in args or not is_admin():
+            pass
+        else:
+            wait_for_enter()
+        sys.exit(code)
     code = main(args)
     if code == 0 and "--once" in args and not scheduled_task_installed():
         print("\n提示：上面只是手动跑了一次。想要自动认证（开机 / 登录 / 切换网络 / 睡眠唤醒），")
