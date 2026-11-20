@@ -26,12 +26,11 @@
 
 from __future__ import annotations
 
-import base64
 import json
 import os
 import platform
+import queue
 import re
-import shutil
 import socket
 import subprocess
 import sys
@@ -192,18 +191,30 @@ def load_config():
 def save_config(cfg):
     data = {k: v for k, v in cfg.items() if not k.startswith("_")}
     tmp = CONFIG_PATH + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
+    # config.json 里是明文密码，先按 0600 建临时文件，再原子替换，
+    # 避免别的本地用户读到，也避免替换过程中出现半写的配置。
+    handle = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(handle, "w", encoding="utf-8") as fh:
         json.dump(data, fh, ensure_ascii=False, indent=2)
         fh.write("\n")
     os.replace(tmp, CONFIG_PATH)
 
 
 def has_credentials(cfg):
-    if not str(cfg.get("account") or "").strip():
-        return False
-    if str(cfg.get("password") or "").strip():
-        return True
-    return any(str(p.get("password") or "").strip() for p in (cfg.get("profiles") or []))
+    """只要有任意一条配置同时拿得到账号和密码，就算配置可用。
+
+    账号和密码都可以写在顶层，也可以写在 profile 里（profile 优先、缺省回退顶层），
+    所以这里要按 profile 逐个判断，不能只看顶层 account。
+    """
+    top_account = str(cfg.get("account") or "").strip()
+    top_password = str(cfg.get("password") or "").strip()
+    profiles = [p for p in (cfg.get("profiles") or []) if isinstance(p, dict)] or [{}]
+    for profile in profiles:
+        account = str(profile.get("account") or "").strip() or top_account
+        password = str(profile.get("password") or "").strip() or top_password
+        if account and password:
+            return True
+    return False
 
 
 # ============================================================================
@@ -220,18 +231,44 @@ def load_state():
 
 
 def save_state(state):
+    # 用带 pid 的临时名 + 原子替换：launchd 每分钟一个进程、GUI 也可能同时开，
+    # 固定叫 state.json.tmp 的话两边会互相覆盖半成品。
+    tmp = "%s.%d.tmp" % (STATE_PATH, os.getpid())
     try:
-        tmp = STATE_PATH + ".tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(state, fh, ensure_ascii=False, indent=2)
         os.replace(tmp, STATE_PATH)
     except Exception:
-        pass
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
 
 
 # ============================================================================
 # 日志：按大小轮转，保留固定份数，杜绝无限膨胀
 # ============================================================================
+
+def _lock_file(handle):
+    """给文件加排他锁（阻塞）。Windows 用 msvcrt，类 Unix 用 fcntl。"""
+    if IS_WIN:
+        import msvcrt
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+    else:
+        import fcntl
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+
+
+def _unlock_file(handle):
+    if IS_WIN:
+        import msvcrt
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
 
 class Logger(object):
     """写 <log_file>，超限就轮转；同时按需打印到控制台。
@@ -242,7 +279,12 @@ class Logger(object):
     """
 
     def __init__(self, cfg, verbose=True):
-        self.path = os.path.join(BASE_DIR, cfg.get("log_file") or "login.log")
+        name = cfg.get("log_file") or "login.log"
+        # 日志里有账号和网络信息，.gitignore 按 *.log* 兜底。为了让这份兜底始终有效，
+        # 强制日志以 .log 结尾——用户写 run.txt 也不会在仓库里留下可能被误提交的文件。
+        if not name.endswith(".log"):
+            name += ".log"
+        self.path = os.path.join(BASE_DIR, name)
         self.max_bytes = max(16, int(cfg.get("log_max_kb", 512))) * 1024
         self.backups = max(0, int(cfg.get("log_backup_count", 3)))
         self.verbose = verbose
@@ -295,24 +337,26 @@ class Logger(object):
                 self._repeat += 1
                 if now - self._repeat_reported >= 60:
                     self._repeat_reported = now
-                    self._write("%s  （上一条消息又重复了 %d 次）"
-                                % (time.strftime("%Y-%m-%d %H:%M:%S"), self._repeat))
+                    self.write_locked("%s  （上一条消息又重复了 %d 次）"
+                                      % (time.strftime("%Y-%m-%d %H:%M:%S"), self._repeat))
                     self._repeat = 0
                     if self.verbose:
                         self._print(line)
                 return
             if self._repeat:
-                self._write("%s  （上一条消息共重复 %d 次）"
-                            % (time.strftime("%Y-%m-%d %H:%M:%S"), self._repeat))
+                self.write_locked("%s  （上一条消息共重复 %d 次）"
+                                  % (time.strftime("%Y-%m-%d %H:%M:%S"), self._repeat))
                 self._repeat = 0
             self._last_line = message
             self._repeat_reported = now
-            self._write(line)
+            self.write_locked(line)
         if self.verbose:
             self._print(line)
 
     def _write(self, line):
         try:
+            # 别的进程可能刚写过或轮转过，缓存的大小会过时，写之前按磁盘实际情况校正
+            self._size = self._current_size()
             if self._size >= self.max_bytes:
                 self._rotate()
             with open(self.path, "a", encoding="utf-8") as fh:
@@ -320,6 +364,30 @@ class Logger(object):
             self._size += len(line.encode("utf-8")) + 1
         except OSError:
             pass
+
+    def write_locked(self, line):
+        """跨进程安全地写一行（轮转 + 追加都在锁内）。
+
+        launchd 每 60 秒起一个独立进程、GUI 也可能同时开着一个，
+        只靠 threading.RLock 拦不住进程间的竞争：A 正在把 login.log 改名，
+        B 同时在往里追加，那几行就丢了。这里加操作系统级的文件锁。
+        """
+        lock_path = self.path + ".lock"
+        handle = None
+        try:
+            handle = open(lock_path, "a+")
+            _lock_file(handle)
+        except OSError:
+            handle = None
+        try:
+            self._write(line)
+        finally:
+            if handle is not None:
+                try:
+                    _unlock_file(handle)
+                except Exception:
+                    pass
+                handle.close()
 
     @staticmethod
     def _print(line):
@@ -356,14 +424,25 @@ class Logger(object):
 
 def run(cmd, timeout=20, encoding="utf-8"):
     """跑个命令拿 stdout；失败返回空串，绝不抛异常。"""
+    return run_result(cmd, timeout=timeout, encoding=encoding)[1]
+
+
+def run_result(cmd, timeout=20, encoding="utf-8"):
+    """跑个命令，返回 (退出码, stdout, stderr)。
+
+    需要判断成败时用这个，别用 run()——它只给 stdout，失败和「命令成功但没有输出」
+    看起来一模一样，会把失败的安装/连网当成成功。
+    """
     try:
         proc = subprocess.run(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             timeout=timeout, creationflags=NO_WINDOW,
         )
-        return proc.stdout.decode(encoding, "replace")
-    except Exception:
-        return ""
+        return (proc.returncode,
+                proc.stdout.decode(encoding, "replace"),
+                proc.stderr.decode(encoding, "replace"))
+    except Exception as exc:
+        return (-1, "", "%s: %s" % (exc.__class__.__name__, exc))
 
 
 def wifi_device():
@@ -753,14 +832,13 @@ def forget_profile(fingerprint):
 # 认证主流程
 # ============================================================================
 
-def try_login_once(cfg, log, portal, profile, index, timeout, login_timeout, verbose_ok=True):
+def try_login_once(cfg, log, portal, profile, index, timeout, login_timeout):
     """用一份配置提交一次认证，并以外网是否真的通为最终判据。"""
     creds = _profile_credentials(profile, cfg)
     if not creds["password"]:
         log("    %s：没有密码，跳过" % _profile_label(profile, index))
         return "skip", ""
     label = _profile_label(profile, index)
-    ssid = current_ssid(cfg)
     url = build_login_url(portal, cfg, creds)
     try:
         _status, raw = http_request(make_opener(), url, timeout=login_timeout)
@@ -819,7 +897,7 @@ def authenticate(cfg, log, once=False, max_wait=None):
         if not portal:
             # 门户探不到：可能不在校园网，也可能 Wi-Fi 还没连上
             if elapsed >= float(cfg.get("wifi_connect_after_seconds", 8)):
-                last_nudge = maybe_connect_wifi(cfg, log, last_nudge, elapsed)
+                last_nudge = maybe_connect_wifi(cfg, log, last_nudge)
             if attempt >= 3 and attempt % 3 == 0:
                 reachable, _info = connectivity_ok(cfg, timeout)
                 if reachable:
@@ -837,6 +915,7 @@ def authenticate(cfg, log, once=False, max_wait=None):
 
             ordered = candidate_profiles(cfg, current_ssid(cfg), fingerprint)
             rejected = []
+            skipped = 0
             for position, (index, profile, why) in enumerate(ordered, 1):
                 state, detail = try_login_once(
                     cfg, log, portal, profile, index, timeout, login_timeout)
@@ -846,14 +925,20 @@ def authenticate(cfg, log, once=False, max_wait=None):
                     return 0
                 if state == "authfail":
                     rejected.append((_profile_label(profile, index), detail))
+                elif state == "skip":
+                    skipped += 1
                 if position < len(ordered):
                     log("    这一份没成，换下一份配置")
 
-            if ordered and len(rejected) == len(ordered):
-                # 所有配置都被门户明确拒绝：账号/密码问题，再试也没意义
+            # 没有任何一条配置真正提交过（全被跳过）说明配置有问题；
+            # 提交过的全被门户拒绝说明账号密码有问题。两种都不该继续重试。
+            if ordered and len(rejected) + skipped == len(ordered):
                 forget_profile(fingerprint)
-                log("所有配置都被门户拒绝：%s" % "；".join("%s→%s" % r for r in rejected))
-                log("请检查一卡通号、密码，以及 profiles 里各条的后缀（@cmcc/@dx/@lt）")
+                if rejected:
+                    log("所有配置都被门户拒绝：%s" % "；".join("%s→%s" % r for r in rejected))
+                    log("请检查一卡通号、密码，以及 profiles 里各条的后缀（@cmcc/@dx/@lt）")
+                else:
+                    log("所有配置都因为缺密码被跳过：请在 profiles 或顶层的 password 里填上密码")
                 return 2
             log("第 %d 次：外网仍不通，%g 秒后重试" % (attempt, wait))
 
@@ -863,7 +948,7 @@ def authenticate(cfg, log, once=False, max_wait=None):
         time.sleep(wait)
 
 
-def maybe_connect_wifi(cfg, log, last_nudge, elapsed):
+def maybe_connect_wifi(cfg, log, last_nudge):
     """完全没有网络时，主动去连配置里的无线网络。
 
     只在「一个可用网络都没有」时才动手，不会把已经能上网的机器抢过来。
@@ -943,34 +1028,54 @@ def first_run_wizard(force=False):
         while not account:
             account = input(" 1/3 一卡通号：").strip()
         password = input(" 2/3 密码（校园网和宽带是同一个）：").strip()
-        print(" 3/3 有没有运营商宽带（宿舍里的 SEU-ISP）？")
-        print("      1 = 中国移动   2 = 中国电信   3 = 中国联通   回车 = 没有/不确定")
-        choice = input("      [回车 = 都配上，程序自己挑]：").strip()
+        print(" 3/3 宿舍的运营商宽带（SEU-ISP）是哪一家？")
+        print("      1 = 中国移动   2 = 中国电信   3 = 中国联通")
+        print("      回车 = 不确定 / 都写上，让程序自己去试")
+        choice = input("      [回车 = 不确定，三家都配上]：").strip()
     except (EOFError, KeyboardInterrupt):
         print("\n 已取消。")
         return False
 
-    if choice in CARRIERS:
-        suffix, carrier = CARRIERS[choice]
-        first_name = "运营商宽带（宿舍，%s）" % carrier
-    else:
-        suffix, carrier = CARRIERS["1"]
-        first_name = "运营商宽带（宿舍，移动）"
-
     cfg = json.loads(json.dumps(DEFAULT_CONFIG))
     cfg["account"] = account
     cfg["password"] = password
-    cfg["profiles"][0]["name"] = first_name
-    cfg["profiles"][0]["account_suffix"] = suffix
-    cfg["profiles"][0]["priority"] = 10
-    cfg["profiles"][1]["priority"] = 20
+    wlan_profile = cfg["profiles"][1]
+
+    if choice in CARRIERS:
+        # 明确知道是哪家：只配这一条 + 校园网
+        suffix, carrier = CARRIERS[choice]
+        isp_profiles = [{
+            "name": "运营商宽带（宿舍，%s）" % carrier,
+            "ssids": ["SEU-ISP"],
+            "account_prefix": "",
+            "account_suffix": suffix,
+            "priority": 10,
+            "note": "宿舍里的 SEU-ISP，走%s认证" % carrier,
+        }]
+    else:
+        # 不确定：三家都写上，认证时会依次尝试，失败的那几条自动跳过。
+        # 不要默认成 @cmcc——电信/联通用 @cmcc 会一直认证失败。
+        isp_profiles = [{
+            "name": "运营商宽带（宿舍，%s，不确定就都试）" % carrier,
+            "ssids": ["SEU-ISP"],
+            "account_prefix": "",
+            "account_suffix": suffix,
+            "priority": 10 + offset,
+            "note": "不确定运营商时自动尝试；确认后可删掉用不上的两条",
+        } for offset, (suffix, carrier) in enumerate(
+            (CARRIERS["1"], CARRIERS["2"], CARRIERS["3"]))]
+
+    wlan_profile["priority"] = 50
+    cfg["profiles"] = isp_profiles + [wlan_profile]
     try:
         save_config(cfg)
     except OSError as exc:
         print(" 写配置失败：%s" % exc)
         return False
     print("\n 已保存：%s" % CONFIG_PATH)
-    print(" 两条配置都写好了（宿舍优先走运营商宽带，教室走校园网），程序自己挑能用的那条。")
+    print(" 共写了 %d 条账号写法（宿舍走运营商宽带、教室走校园网），"
+          "程序会自己挑能用的那条。" % len(cfg["profiles"]))
+    print(" 不确定运营商的话，用不上的那几条会自动跳过，不用管。")
     print(" 接下来试一次认证，结果打印在下面。\n")
     return True
 
@@ -1003,6 +1108,25 @@ def run_gui():
     root.minsize(480, 520)
 
     state = {"status": None, "busy": False}
+    # worker 线程不直接碰界面：Tk 不是线程安全的，从子线程改控件或调 root.after
+    # 可能抛 "main thread is not in main loop"，也可能把 Tcl 解释器搞坏。
+    # 子线程只把「结果」放进队列，主线程用 after() 定时取出来渲染。
+    ui_queue = queue.Queue()
+
+    def ui_thread_safe(func):
+        ui_queue.put(func)
+
+    def pump_ui_queue():
+        try:
+            while True:
+                func = ui_queue.get_nowait()
+                try:
+                    func()
+                except Exception:
+                    pass
+        except queue.Empty:
+            pass
+        root.after(60, pump_ui_queue)
 
     title = tk.Label(root, text="校园网自动认证", bg=COLORS["bg"], fg=COLORS["text"],
                      font=("PingFang SC", 16, "bold"))
@@ -1104,29 +1228,6 @@ def run_gui():
                                      font=("Menlo", 10), wrap="word")
     tail.pack(fill="both", expand=True, padx=16, pady=(0, 14))
 
-    def open_path(path):
-        try:
-            if IS_MAC:
-                subprocess.Popen(["open", path])
-            elif IS_WIN:
-                os.startfile(path)  # noqa: 只在 Windows 上存在
-            else:
-                subprocess.Popen(["xdg-open", path])
-        except Exception as exc:
-            messagebox.showerror("打不开", "%s\n%s" % (path, exc))
-
-    def open_config():
-        if not os.path.exists(CONFIG_PATH):
-            try:
-                save_config(cfg)
-            except OSError as exc:
-                messagebox.showerror("写配置失败", str(exc))
-                return
-        open_path(CONFIG_PATH)
-
-    def open_log():
-        open_path(log.path)
-
     def apply_status(info):
         state["status"] = info
         if info["connectivity"]:
@@ -1176,7 +1277,7 @@ def run_gui():
                 info = collect_status(load_config())
             except Exception as exc:
                 info = {"error": str(exc)}
-            root.after(0, lambda: finish_refresh(info))
+            ui_thread_safe(lambda: finish_refresh(info))
 
         def finish_refresh(info):
             set_busy(False)
@@ -1194,27 +1295,46 @@ def run_gui():
         set_busy(True, "认证中…" if action == "login" else "注销中…")
 
         def work():
-            cfg_now = load_config()
-            log_now = Logger(cfg_now, verbose=False)
-            code = None
-            if action == "login":
-                code = authenticate(cfg_now, log_now, once=False)
-            else:
-                portal, _detail = find_portal(make_opener(), cfg_now,
-                                              float(cfg_now.get("request_timeout_seconds", 4)))
-                if portal:
-                    do_logout(portal, cfg_now, lambda message: log_now(message))
+            # 后台工作整段兜住异常：否则线程一死，finish_action 永远不会入队，
+            # 界面就卡在「认证中…」并且所有按钮都点不动。
+            code = 1
+            message = ""
+            try:
+                cfg_now = load_config()
+                log_now = Logger(cfg_now, verbose=False)
+                if action == "login":
+                    code = authenticate(cfg_now, log_now, once=False)
                 else:
-                    log_now("找不到门户，无法注销")
-            root.after(0, lambda: (set_busy(False),
-                                   status_label.configure(
-                                       text="完成" if code in (0, None) else "未成功",
-                                       fg=COLORS["ok"] if code in (0, None) else COLORS["bad"]),
-                                   refresh()))
+                    portal, detail = find_portal(
+                        make_opener(), cfg_now,
+                        float(cfg_now.get("request_timeout_seconds", 4)))
+                    if portal:
+                        ok, _text = do_logout(portal, cfg_now, log_now)
+                        # 注销失败要让用户看到红色「未成功」，不能一律显示完成
+                        code = 0 if ok else 1
+                        message = "" if ok else "门户拒绝注销"
+                    else:
+                        log_now("找不到门户，无法注销")
+                        code = 1
+                        message = "找不到门户"
+            except Exception as exc:
+                code = 1
+                message = "%s: %s" % (exc.__class__.__name__, exc)
+
+            def finish_action():
+                set_busy(False)
+                ok = code == 0
+                status_label.configure(
+                    text="完成" if ok else ("未成功" + (("（%s）" % message) if message else "")),
+                    fg=COLORS["ok"] if ok else COLORS["bad"])
+                refresh()
+
+            ui_thread_safe(finish_action)
 
         threading.Thread(target=work, daemon=True).start()
 
     refresh()
+    pump_ui_queue()
 
     if not has_credentials(cfg):
         root.after(300, lambda: messagebox.showinfo(
@@ -1254,9 +1374,20 @@ def _pick_python():
     return sys.executable or "python3"
 
 
+def _autostart_command():
+    """拼出「怎么启动本程序」的参数表。
+
+    打包成独立程序（PyInstaller 等）时 sys.executable 就是程序本身、不需要脚本路径；
+    源码运行时则是 `python3 脚本 子命令`。两种情况都要能得到一个稳定的绝对路径，
+    否则写进自启配置后重启就失效。
+    """
+    if getattr(sys, "frozen", False):
+        return [os.path.abspath(sys.executable)]
+    return [os.path.abspath(_pick_python()), os.path.abspath(__file__)]
+
+
 def install_autostart(interval=60, log=print):
-    script = os.path.abspath(__file__)
-    python = _pick_python()
+    launcher = _autostart_command()
     if IS_MAC:
         plist = """<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -1265,10 +1396,7 @@ def install_autostart(interval=60, log=print):
   <key>Label</key><string>{label}</string>
   <key>ProgramArguments</key>
   <array>
-    <string>{python}</string>
-    <string>{script}</string>
-    <string>login</string>
-    <string>--quiet</string>
+{args}
   </array>
   <key>RunAtLoad</key><true/>
   <key>StartInterval</key><integer>{interval}</integer>
@@ -1278,33 +1406,42 @@ def install_autostart(interval=60, log=print):
   <key>LowPriorityIO</key><true/>
 </dict>
 </plist>
-""".format(label=LAUNCHD_LABEL, python=python, script=script, interval=int(interval),
-           out=os.path.join(BASE_DIR, "launchd.out.log"),
-           err=os.path.join(BASE_DIR, "launchd.err.log"))
+""".format(
+            label=LAUNCHD_LABEL,
+            args="\n".join("    <string>%s</string>" % part
+                           for part in launcher + ["login", "--quiet"]),
+            interval=int(interval),
+            out=os.path.join(BASE_DIR, "launchd.out.log"),
+            err=os.path.join(BASE_DIR, "launchd.err.log"))
         path = _launchd_plist_path()
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as fh:
             fh.write(plist)
         uid = os.getuid()
         run(["launchctl", "bootout", "gui/%d/%s" % (uid, LAUNCHD_LABEL)])
-        out = run(["launchctl", "bootstrap", "gui/%d" % uid, path])
+        code, _out, err = run_result(["launchctl", "bootstrap", "gui/%d" % uid, path])
+        if code != 0:
+            log("写入 %s 成功，但 launchctl bootstrap 失败（退出码 %d）：%s"
+                % (path, code, (err or _out).strip()[:200]))
+            log("常见原因：这个 Label 已被别的 launchd 会话占用，先跑 uninstall 再装一次。")
+            return 1
         run(["launchctl", "enable", "gui/%d/%s" % (uid, LAUNCHD_LABEL)])
         log("已安装开机自启：%s" % path)
         log("每 %d 秒检查一次；日志在 %s" % (int(interval), os.path.join(BASE_DIR, "login.log")))
-        if out.strip():
-            log("launchctl 输出：%s" % out.strip()[:200])
-        log("立即生效已尝试；要停用跑 `%s uninstall`" % os.path.basename(script))
+        log("要停用跑 `%s uninstall`" % os.path.basename(launcher[-1]))
         return 0
 
     # Windows：登录后触发 + 每 N 分钟
     task = "SEU-Net-AutoLogin"
     run(["schtasks", "/Delete", "/TN", task, "/F"])
-    cmd = '"%s" "%s" login --quiet' % (python, script)
-    out = run(["schtasks", "/Create", "/TN", task, "/TR", cmd, "/SC", "MINUTE",
-               "/MO", str(int(interval)), "/F", "/RL", "LIMITED"])
+    cmd = "%s login --quiet" % " ".join('"%s"' % part for part in launcher)
+    code, out, err = run_result(
+        ["schtasks", "/Create", "/TN", task, "/TR", cmd, "/SC", "MINUTE",
+         "/MO", str(int(interval)), "/F", "/RL", "LIMITED"], encoding="gbk")
+    if code != 0:
+        log("创建计划任务 %s 失败（退出码 %d）：%s" % (task, code, (err or out).strip()[:200]))
+        return 1
     log("已创建计划任务 %s（每 %d 分钟）" % (task, int(interval)))
-    if out.strip():
-        log(out.strip()[:200])
     return 0
 
 
@@ -1336,7 +1473,7 @@ def doctor(cfg, log):
     log("配置文件：%s（%s）" % (CONFIG_PATH, "存在" if os.path.exists(CONFIG_PATH) else "不存在"))
     if cfg.get("_config_error"):
         log("配置问题：%s" % cfg["_config_error"])
-    log("账号已填：%s" % ("是" if cfg.get("account") else "否"))
+    log("账号已填：%s" % ("是" if has_credentials(cfg) else "否（缺一卡通号或密码）"))
 
     ssid = current_ssid(cfg)
     log("当前 SSID：%s" % (ssid or "读不到"))
@@ -1402,11 +1539,21 @@ def do_logout(portal, cfg, log=None):
 
 
 def main(argv):
-    args = [arg for arg in argv if not arg.startswith("--")]
     flags = [arg for arg in argv if arg.startswith("--")]
+    args = [arg for arg in argv if not arg.startswith("-")]
+
+    # --help / -h 是全局开关，不能被当成「没有子命令 → 默认 login」，
+    # 否则 `seu_net.py --help` 会真的去认证一次。
+    if "--help" in flags or "-h" in argv:
+        print(USAGE)
+        return 0
+    if "--version" in flags:
+        print("东南大学校园网自动认证 v%s" % VERSION)
+        return 0
+
     command = args[0] if args else "login"
 
-    if command in ("help", "-h", "version"):
+    if command in ("help", "version"):
         print(USAGE)
         return 0
 

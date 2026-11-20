@@ -1,12 +1,37 @@
+# 敏感文件：含明文密码 / 账号 / 网络信息。
+# 不锚定根目录——脚本可能被放进子目录运行，config.json 永远跟着脚本走。
 config.json
 state.json
-login.log
-login.log.*
-launchd.out.log
-launchd.err.log
+
+# 日志（代码里强制 log_file 以 .log 结尾，所以 *.log 就能覆盖轮转和锁文件）
+*.log
+*.log.*
+
+# 环境变量
+.env
+.env.*
+!.env.example
+
+# Python
 __pycache__/
 *.pyc
-build/
-dist/
-*.spec
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+htmlcov/
+
+# 打包产物（只忽略仓库根目录的，别误伤源码里的同名目录）
+/build/
+/dist/
+
+# 编辑器 / 系统
 .DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/

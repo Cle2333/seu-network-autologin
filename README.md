@@ -29,6 +29,10 @@ $ python3 seu_net.py status
 
 ## 快速开始
 
+**双击启动**：macOS 双击 `启动.command`，Windows 双击 `启动.cmd`，直接打开图形界面。
+
+命令行：
+
 ```bash
 git clone <repo> && cd seu-network-autologin
 python3 seu_net.py init      # 问三个问题，生成 config.json
@@ -36,7 +40,10 @@ python3 seu_net.py           # 试一次认证，看到「认证完成」就成�
 python3 seu_net.py install   # 装成开机自启（每 60 秒检查一次）
 ```
 
-图形界面把上面这套做成按钮：`python3 seu_net.py gui`
+> 第一次双击 `启动.command` 如果提示「无法验证开发者」，右键 →「打开」即可；
+> 或者 `chmod +x 启动.command` 一次。
+> Windows 上双击后如果一闪而过，说明缺 Python——脚本会提示去 python.org 装（记得勾选
+> “Add python.exe to PATH”）。
 
 ## 命令
 
@@ -133,6 +140,13 @@ Windows 上额外说明：任务计划在**用户登录后**才跑（不是锁�
 但**这两种都不是最终判据**——程序会再请求一次外网，真通了才算认证成功
 （未认证时请求会被门户劫持成登录页，内容对不上）。
 
+## 用 `init` 不确定运营商时
+
+第三问问「宿舍宽带是哪一家」时直接回车，程序会把**移动 `@cmcc`、电信 `@dx`、联通 `@lt` 三条都写上**，
+认证时依次尝试，失败的那个自动跳过。所以不需要你事先搞清楚自己属于哪家。
+
+确认之后可以手动删掉用不上的两条，认证会更快（少一次无效尝试）。
+
 ## 排查
 
 先跑 `python3 seu_net.py doctor`。常见情况：
@@ -149,6 +163,8 @@ Windows 上额外说明：任务计划在**用户登录后**才跑（不是锁�
 
 ```
 seu_net.py            主程序（单文件，标准库，子命令切功能）
+启动.command          macOS 双击打开界面
+启动.cmd              Windows 双击打开界面
 config.example.json   配置模板（带注释）
 config.json           你的配置（含明文密码，已 gitignore）
 state.json            记住哪个网络用哪份配置（自动生成，已 gitignore）
