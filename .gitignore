@@ -1,8 +1,12 @@
 config.json
+state.json
 login.log
-login.lock
+login.log.*
+launchd.out.log
+launchd.err.log
 __pycache__/
 *.pyc
 build/
 dist/
 *.spec
+.DS_Store
