@@ -345,3 +345,9 @@ input::placeholder { color: var(--dim); opacity: .65; }
 }
 ::-webkit-scrollbar-thumb:hover { background: var(--dim); }
 ::-webkit-scrollbar-track { background: transparent; }
+
+.divider {
+  height: 1px;
+  background: var(--line);
+  margin: 6px 0 2px;
+}

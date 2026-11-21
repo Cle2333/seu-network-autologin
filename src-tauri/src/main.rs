@@ -393,6 +393,228 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------- 开机自启
+//
+// 直接写系统自启项，不引第三方插件：
+//   macOS   ~/Library/LaunchAgents/cn.edu.seu.net.autologin.gui.plist
+//   Windows  HKCU\Software\Microsoft\Windows\CurrentVersion\Run
+//
+// 注意这和命令行版的 `seu_net.py install` 是两套东西：
+// 那个装的是「定时跑 login --quiet」的后台任务，这个是「开机启动图形界面」。
+// 两者可以同时存在，靠单实例锁互不影响。
+
+const AUTOSTART_LABEL: &str = "cn.edu.seu.net.autologin.gui";
+
+fn macos_plist_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(home)
+        .join("Library/LaunchAgents")
+        .join(format!("{AUTOSTART_LABEL}.plist"))
+}
+
+#[cfg(target_os = "macos")]
+fn autostart_enabled() -> bool {
+    macos_plist_path().exists()
+}
+
+#[cfg(target_os = "windows")]
+fn autostart_enabled() -> bool {
+    Command::new("reg")
+        .args(["query", r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run", "/v", AUTOSTART_LABEL])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn autostart_enabled() -> bool {
+    let home = std::env::var("HOME").unwrap_or_default();
+    PathBuf::from(home)
+        .join(".config/autostart")
+        .join(format!("{AUTOSTART_LABEL}.desktop"))
+        .exists()
+}
+
+#[tauri::command]
+fn autostart_state() -> bool {
+    autostart_enabled()
+}
+
+#[tauri::command]
+fn set_autostart(enabled: bool) -> Result<bool, String> {
+    if enabled {
+        enable_autostart()?;
+    } else {
+        disable_autostart()?;
+    }
+    Ok(autostart_enabled())
+}
+
+// ---- 后台自动认证任务 ----
+//
+// 和上面的「开机启动界面」是两件事：这个装的是 seu_net.py 的定时任务，
+// 由系统在后台每 60 秒跑一次 `login --quiet`，跟界面开没开无关。
+// 所以退出应用后仍然会自动重连——靠的就是它。
+
+#[tauri::command]
+async fn daemon_state(state: tauri::State<'_, Backend>) -> Result<serde_json::Value, String> {
+    blocking(&state, |backend| {
+        let out = run_backend(&backend, &["status", "--json"], None);
+        let info: serde_json::Value = serde_json::from_str(&out.stdout)
+            .map_err(|e| format!("{e}"))?;
+        Ok(info.get("autostart").cloned().unwrap_or(serde_json::Value::Null))
+    })
+    .await
+}
+
+#[tauri::command]
+async fn set_daemon(state: tauri::State<'_, Backend>, enabled: bool) -> Result<serde_json::Value, String> {
+    let cmd = if enabled { "install" } else { "uninstall" };
+    blocking(&state, move |backend| {
+        require_ready(&backend)?;
+        let out = run_backend(&backend, &[cmd], None);
+        if out.code != 0 {
+            return Err(format!(
+                "{}失败：{}",
+                if enabled { "安装" } else { "卸载" },
+                (out.stderr.trim().is_empty() && out.stdout.trim().is_empty())
+                    .then(|| "未知错误".to_string())
+                    .unwrap_or_else(|| format!("{}{}", out.stdout.trim(), out.stderr.trim()))
+            ));
+        }
+        Ok(serde_json::json!({ "ok": true, "output": out.stdout }))
+    })
+    .await
+}
+
+#[cfg(target_os = "macos")]
+fn enable_autostart() -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let path = macos_plist_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let plist = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>{label}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{exe}</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>ProcessType</key><string>Interactive</string>
+</dict>
+</plist>
+"#,
+        label = AUTOSTART_LABEL,
+        exe = exe.display()
+    );
+    std::fs::write(&path, plist).map_err(|e| format!("写 plist 失败：{e}"))?;
+
+    // 卸载旧的再装，避免已加载时改配置不生效
+    let uid = Command::new("id").arg("-u").output().ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    let target = format!("gui/{uid}/{AUTOSTART_LABEL}");
+    let _ = Command::new("launchctl").args(["bootout", &target]).output();
+    let out = Command::new("launchctl")
+        .args(["bootstrap", &format!("gui/{uid}"), path.to_str().unwrap_or("")])
+        .output()
+        .map_err(|e| format!("launchctl 调用失败：{e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "launchctl bootstrap 失败：{}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn disable_autostart() -> Result<(), String> {
+    let uid = Command::new("id").arg("-u").output().ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    let _ = Command::new("launchctl")
+        .args(["bootout", &format!("gui/{uid}/{AUTOSTART_LABEL}")])
+        .output();
+    let path = macos_plist_path();
+    if path.exists() {
+        std::fs::remove_file(&path).map_err(|e| format!("删除 plist 失败：{e}"))?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn enable_autostart() -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let out = Command::new("reg")
+        .args([
+            "add",
+            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
+            "/v",
+            AUTOSTART_LABEL,
+            "/t",
+            "REG_SZ",
+            "/d",
+            &format!("\"{}\"", exe.display()),
+            "/f",
+        ])
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        return Err(format!("写注册表失败：{}", String::from_utf8_lossy(&out.stderr).trim()));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn disable_autostart() -> Result<(), String> {
+    let _ = Command::new("reg")
+        .args([
+            "delete",
+            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
+            "/v",
+            AUTOSTART_LABEL,
+            "/f",
+        ])
+        .output();
+    Ok(())
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn enable_autostart() -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let home = std::env::var("HOME").unwrap_or_default();
+    let dir = PathBuf::from(home).join(".config/autostart");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let content = format!(
+        "[Desktop Entry]\nType=Application\nName=东南大学校园网\nExec={}\nX-GNOME-Autostart-enabled=true\n",
+        exe.display()
+    );
+    std::fs::write(dir.join(format!("{AUTOSTART_LABEL}.desktop")), content)
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn disable_autostart() -> Result<(), String> {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let path = PathBuf::from(home)
+        .join(".config/autostart")
+        .join(format!("{AUTOSTART_LABEL}.desktop"));
+    if path.exists() {
+        std::fs::remove_file(&path).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 fn main() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
@@ -404,10 +626,20 @@ fn main() {
             logout,
             read_log,
             open_data_dir,
+            autostart_state,
+            set_autostart,
+            daemon_state,
+            set_daemon,
         ])
         .setup(|app| {
             let backend = locate_backend(app.handle());
             app.manage(backend);
+
+            // 不占 Dock：这是个菜单栏小工具，Dock 里多一个图标纯属碍事。
+            // Accessory 策略下窗口仍能正常显示和聚焦，只是不进 Dock、不占 Cmd+Tab。
+            #[cfg(target_os = "macos")]
+            app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+
             build_tray(app.handle())?;
 
             // 窗口配置里是 visible:false。等页面加载完再 show——直接 show 的话

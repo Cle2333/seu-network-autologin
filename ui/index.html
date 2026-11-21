@@ -49,6 +49,24 @@
 
   <!-- 设置 -->
   <section class="panel hidden" id="viewSettings">
+    <label class="check">
+      <input id="ckAutostart" type="checkbox">
+      <span>开机自动启动（登录后常驻菜单栏）</span>
+    </label>
+    <p class="hint">关窗口不会退出，只是收起——点菜单栏图标能再打开。彻底退出点菜单栏里的「退出」。</p>
+
+    <div class="divider"></div>
+
+    <label class="check">
+      <input id="ckDaemon" type="checkbox">
+      <span>后台自动认证（退出界面也继续重连）</span>
+    </label>
+    <p class="hint">勾上会装一个系统后台任务，每 60 秒检查一次、换网络时立刻认证。
+      这样即使退出本程序，断网后也能自动连回来。</p>
+    <p class="hint" id="daemonHint"></p>
+
+    <div class="divider"></div>
+
     <label class="field">
       <span>宿舍宽带账号</span>
       <input id="inAccount" type="text" placeholder="一卡通号" autocomplete="off" spellcheck="false">
@@ -86,6 +104,7 @@
 
     <button class="primary small" id="btnSave">保存</button>
     <p class="hint" id="saveHint"></p>
+    <p class="hint" id="autostartHint"></p>
   </section>
 </main>
 

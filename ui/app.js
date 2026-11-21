@@ -26,6 +26,10 @@ const el = {
   ckWlan: $('ckWlan'),
   wlanFields: $('wlanFields'),
   carrierGroup: $('carrierGroup'),
+  ckAutostart: $('ckAutostart'),
+  autostartHint: $('autostartHint'),
+  ckDaemon: $('ckDaemon'),
+  daemonHint: $('daemonHint'),
 };
 
 let carrier = '';        // 当前选中的运营商
@@ -273,6 +277,68 @@ el.ckWlan.addEventListener('change', () => {
   el.wlanFields.classList.toggle('hidden', !el.ckWlan.checked);
 });
 
+// 开机自启：勾上/取消立刻生效，不需要再点保存
+async function loadAutostart() {
+  try {
+    el.ckAutostart.checked = await invoke('autostart_state');
+  } catch (err) {
+    el.autostartHint.textContent = '读取自启状态失败：' + err;
+    el.autostartHint.className = 'hint bad';
+  }
+}
+
+el.ckAutostart.addEventListener('change', async () => {
+  const want = el.ckAutostart.checked;
+  el.autostartHint.textContent = want ? '正在开启…' : '正在关闭…';
+  el.autostartHint.className = 'hint';
+  try {
+    const actual = await invoke('set_autostart', { enabled: want });
+    el.ckAutostart.checked = actual;
+    el.autostartHint.textContent = actual
+      ? '已开启，下次登录会自动出现在菜单栏'
+      : '已关闭';
+    el.autostartHint.className = 'hint ok';
+  } catch (err) {
+    el.ckAutostart.checked = !want;     // 失败就还原勾选
+    el.autostartHint.textContent = String(err);
+    el.autostartHint.className = 'hint bad';
+  }
+});
+
+// 后台自动认证任务：装的是 seu_net.py 的系统定时任务，跟界面开没开无关，
+// 所以退出应用后断网照样能自动重连。
+async function loadDaemon() {
+  try {
+    const info = await invoke('daemon_state');
+    el.ckDaemon.checked = !!(info && info.installed);
+    if (info && info.detail) {
+      el.daemonHint.textContent = info.detail;
+      el.daemonHint.className = 'hint';
+    }
+  } catch (err) {
+    el.daemonHint.textContent = '读取后台任务状态失败：' + err;
+    el.daemonHint.className = 'hint bad';
+  }
+}
+
+el.ckDaemon.addEventListener('change', async () => {
+  const want = el.ckDaemon.checked;
+  el.daemonHint.textContent = want ? '正在安装…' : '正在卸载…';
+  el.daemonHint.className = 'hint';
+  try {
+    await invoke('set_daemon', { enabled: want });
+    await loadDaemon();
+    el.daemonHint.textContent = want
+      ? '已安装：每 60 秒检查一次，退出本程序也会继续工作'
+      : '已卸载';
+    el.daemonHint.className = 'hint ok';
+  } catch (err) {
+    el.ckDaemon.checked = !want;
+    el.daemonHint.textContent = String(err);
+    el.daemonHint.className = 'hint bad';
+  }
+});
+
 // 托盘里点「立即认证」
 listen('tray-login', () => doLogin());
 
@@ -280,6 +346,8 @@ listen('tray-login', () => doLogin());
 
 refresh();
 loadConfig();
+loadAutostart();
+loadDaemon();
 
 // 定时刷新。窗口被隐藏（点关闭只是收起，托盘还在）时就别轮询了——
 // 每次刷新都要起 Python 进程，看不见的时候纯属浪费。
