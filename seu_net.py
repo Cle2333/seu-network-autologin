@@ -1015,8 +1015,50 @@ def collect_status(cfg):
 CARRIERS = {"1": ("@cmcc", "中国移动"), "2": ("@dx", "中国电信"), "3": ("@lt", "中国联通")}
 
 
+def build_config(account, password, carrier_choice=""):
+    """按「一卡通 + 密码 + 运营商选择」生成一份完整配置。
+
+    carrier_choice 是 "1"/"2"/"3"（明确知道哪家），留空表示不确定——
+    这时三家都写上，认证时依次尝试、失败的自助跳过。
+    命令行向导和图形界面的设置对话框共用这一份逻辑。
+    """
+    cfg = json.loads(json.dumps(DEFAULT_CONFIG))
+    cfg["account"] = account
+    cfg["password"] = password
+    wlan_profile = cfg["profiles"][1]
+
+    if carrier_choice in CARRIERS:
+        suffix, carrier = CARRIERS[carrier_choice]
+        isp_profiles = [{
+            "name": "运营商宽带（宿舍，%s）" % carrier,
+            "ssids": ["SEU-ISP"],
+            "account_prefix": "",
+            "account_suffix": suffix,
+            "priority": 10,
+            "note": "宿舍里的 SEU-ISP，走%s认证" % carrier,
+        }]
+    else:
+        # 不确定：三家都写上。不要默认成 @cmcc——电信/联通用 @cmcc 会一直认证失败。
+        isp_profiles = [{
+            "name": "运营商宽带（宿舍，%s，不确定就都试）" % carrier,
+            "ssids": ["SEU-ISP"],
+            "account_prefix": "",
+            "account_suffix": suffix,
+            "priority": 10 + offset,
+            "note": "不确定运营商时自动尝试；确认后可删掉用不上的两条",
+        } for offset, (suffix, carrier) in enumerate(
+            (CARRIERS["1"], CARRIERS["2"], CARRIERS["3"]))]
+
+    wlan_profile["priority"] = 50
+    cfg["profiles"] = isp_profiles + [wlan_profile]
+    return cfg
+
+
 def first_run_wizard(force=False):
-    """没配置时问三个问题，写出 config.json。"""
+    """没配置时在终端里问三个问题，写出 config.json。
+
+    注意：只有能交互的终端才走这里。双击启动（没有终端）时由 GUI 的设置对话框接手。
+    """
     if not force and not (sys.stdin and sys.stdout and sys.stdout.isatty()):
         return False
     print()
@@ -1036,37 +1078,7 @@ def first_run_wizard(force=False):
         print("\n 已取消。")
         return False
 
-    cfg = json.loads(json.dumps(DEFAULT_CONFIG))
-    cfg["account"] = account
-    cfg["password"] = password
-    wlan_profile = cfg["profiles"][1]
-
-    if choice in CARRIERS:
-        # 明确知道是哪家：只配这一条 + 校园网
-        suffix, carrier = CARRIERS[choice]
-        isp_profiles = [{
-            "name": "运营商宽带（宿舍，%s）" % carrier,
-            "ssids": ["SEU-ISP"],
-            "account_prefix": "",
-            "account_suffix": suffix,
-            "priority": 10,
-            "note": "宿舍里的 SEU-ISP，走%s认证" % carrier,
-        }]
-    else:
-        # 不确定：三家都写上，认证时会依次尝试，失败的那几条自动跳过。
-        # 不要默认成 @cmcc——电信/联通用 @cmcc 会一直认证失败。
-        isp_profiles = [{
-            "name": "运营商宽带（宿舍，%s，不确定就都试）" % carrier,
-            "ssids": ["SEU-ISP"],
-            "account_prefix": "",
-            "account_suffix": suffix,
-            "priority": 10 + offset,
-            "note": "不确定运营商时自动尝试；确认后可删掉用不上的两条",
-        } for offset, (suffix, carrier) in enumerate(
-            (CARRIERS["1"], CARRIERS["2"], CARRIERS["3"]))]
-
-    wlan_profile["priority"] = 50
-    cfg["profiles"] = isp_profiles + [wlan_profile]
+    cfg = build_config(account, password, choice)
     try:
         save_config(cfg)
     except OSError as exc:
@@ -1175,6 +1187,100 @@ def run_gui():
     def open_log():
         open_path(log.path)
 
+    def open_settings():
+        """真正的设置对话框：直接在界面里填账号密码，不用去编辑 JSON。"""
+        dialog = tk.Toplevel(root)
+        dialog.title("设置账号密码")
+        dialog.configure(bg=COLORS["bg"])
+        dialog.geometry("460x400")
+        dialog.transient(root)
+        dialog.resizable(False, False)
+
+        current = load_config()
+
+        def label(text, top=14):
+            widget = tk.Label(dialog, text=text, bg=COLORS["bg"], fg=COLORS["text"],
+                              font=("PingFang SC", 12), anchor="w")
+            widget.pack(fill="x", padx=20, pady=(top, 2))
+            return widget
+
+        def hint(text):
+            widget = tk.Label(dialog, text=text, bg=COLORS["bg"], fg=COLORS["dim"],
+                              font=("PingFang SC", 10), anchor="w", justify="left",
+                              wraplength=410)
+            widget.pack(fill="x", padx=20, pady=(0, 4))
+            return widget
+
+        label("一卡通号", top=18)
+        account_entry = tk.Entry(dialog, bg="#16171a", fg=COLORS["text"],
+                                 insertbackground=COLORS["text"], relief="flat",
+                                 font=("PingFang SC", 13))
+        account_entry.pack(fill="x", padx=20, ipady=6)
+        account_entry.insert(0, str(current.get("account") or ""))
+
+        label("密码（校园网和宽带是同一个）")
+        password_entry = tk.Entry(dialog, bg="#16171a", fg=COLORS["text"],
+                                  insertbackground=COLORS["text"], relief="flat",
+                                  show="•", font=("PingFang SC", 13))
+        password_entry.pack(fill="x", padx=20, ipady=6)
+        password_entry.insert(0, str(current.get("password") or ""))
+
+        label("宿舍宽带的运营商")
+        hint("不确定就直接用默认的「不确定」，程序会把三家都写上依次试，用不上的自动跳过。")
+
+        carrier_var = tk.StringVar(value="")
+        choices = tk.Frame(dialog, bg=COLORS["bg"])
+        choices.pack(fill="x", padx=20, pady=(2, 0))
+        for value, text in (("", "不确定"), ("1", "移动"), ("2", "电信"), ("3", "联通")):
+            tk.Radiobutton(
+                choices, text=text, value=value, variable=carrier_var,
+                bg=COLORS["bg"], fg=COLORS["text"], selectcolor="#3a3d42",
+                activebackground=COLORS["bg"], activeforeground=COLORS["text"],
+                font=("PingFang SC", 12), highlightthickness=0, bd=0
+            ).pack(side="left", padx=(0, 14))
+
+        message = tk.Label(dialog, text="", bg=COLORS["bg"], fg=COLORS["bad"],
+                           font=("PingFang SC", 11), anchor="w", wraplength=410)
+        message.pack(fill="x", padx=20, pady=(10, 0))
+
+        def do_save():
+            account = account_entry.get().strip()
+            password = password_entry.get().strip()
+            if not account:
+                message.configure(text="一卡通号不能为空。")
+                account_entry.focus_set()
+                return
+            if not password:
+                message.configure(text="密码不能为空。")
+                password_entry.focus_set()
+                return
+            try:
+                save_config(build_config(account, password, carrier_var.get()))
+            except OSError as exc:
+                message.configure(text="保存失败：%s" % exc)
+                return
+            dialog.destroy()
+            status_label.configure(text="设置已保存，正在认证…", fg=COLORS["accent"])
+            refresh()
+            run_action("login")
+
+        def on_return(_event):
+            do_save()
+
+        account_entry.bind("<Return>", on_return)
+        password_entry.bind("<Return>", on_return)
+
+        row = tk.Frame(dialog, bg=COLORS["bg"])
+        row.pack(fill="x", padx=20, pady=(14, 0))
+        save_btn = make_button(row, "保存并认证", do_save)
+        save_btn.pack(side="right")
+        cancel_btn = make_button(row, "取消", dialog.destroy)
+        cancel_btn.pack(side="right", padx=(0, 10))
+
+        dialog.grab_set()
+        account_entry.focus_set()
+        return dialog
+
     def make_button(parent, text, command):
         """用 Label 模拟按钮。
 
@@ -1209,15 +1315,24 @@ def run_gui():
         label.set_enabled = set_enabled
         return label
 
-    button_login = make_button(buttons, "立即认证", lambda: run_action("login"))
+    # 主要操作用一行，次要的放第二行，避免 6 个按钮在窄窗口里挤成一团
+    primary = tk.Frame(root, bg=COLORS["bg"])
+    primary.pack(fill="x", padx=16, pady=(6, 2))
+    secondary = tk.Frame(root, bg=COLORS["bg"])
+    secondary.pack(fill="x", padx=16, pady=(0, 4))
+
+    button_login = make_button(primary, "立即认证", lambda: run_action("login"))
     button_login.pack(side="left", padx=(0, 8))
-    button_logout = make_button(buttons, "注销下线", lambda: run_action("logout"))
+    button_logout = make_button(primary, "注销下线", lambda: run_action("logout"))
     button_logout.pack(side="left", padx=(0, 8))
-    button_refresh = make_button(buttons, "刷新状态", lambda: refresh())
-    button_refresh.pack(side="left", padx=(0, 8))
-    button_config = make_button(buttons, "配置文件", open_config)
+    button_refresh = make_button(primary, "刷新状态", lambda: refresh())
+    button_refresh.pack(side="left")
+
+    button_settings = make_button(secondary, "设置账号", open_settings)
+    button_settings.pack(side="left", padx=(0, 8))
+    button_config = make_button(secondary, "配置原文", open_config)
     button_config.pack(side="left", padx=(0, 8))
-    button_log = make_button(buttons, "打开日志", open_log)
+    button_log = make_button(secondary, "打开日志", open_log)
     button_log.pack(side="left")
 
     tail_title = tk.Label(root, text="最近日志", bg=COLORS["bg"], fg=COLORS["dim"],
@@ -1337,9 +1452,10 @@ def run_gui():
     pump_ui_queue()
 
     if not has_credentials(cfg):
-        root.after(300, lambda: messagebox.showinfo(
-            "还差账号密码",
-            "还没有配置一卡通号和密码。\n\n点「配置文件」填好 account / password 后，再点「立即认证」。"))
+        # 第一次用（或配置不全）：直接把设置对话框弹出来，别让用户自己去改 JSON。
+        status_label.configure(text="还没有填账号密码", fg=COLORS["warn"])
+        detail_label.configure(text="填好一卡通号和密码就能用了，填完会自动认证一次。")
+        root.after(300, open_settings)
 
     root.mainloop()
     return 0
