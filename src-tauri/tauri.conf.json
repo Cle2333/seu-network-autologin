@@ -1,0 +1,49 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "东南大学校园网",
+  "version": "3.0.0",
+  "identifier": "cn.edu.seu.net.autologin",
+  "build": {
+    "frontendDist": "../ui"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "东南大学校园网",
+        "width": 380,
+        "height": 520,
+        "minWidth": 360,
+        "minHeight": 440,
+        "resizable": false,
+        "center": true,
+        "visible": false,
+        "titleBarStyle": "Transparent",
+        "hiddenTitle": true,
+        "transparent": false
+      }
+    ],
+    "withGlobalTauri": true,
+    "trayIcon": {
+      "iconPath": "icons/tray.png",
+      "iconAsTemplate": true,
+      "menuOnLeftClick": false
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": [
+      "app",
+      "dmg"
+    ],
+    "icon": [
+      "icons/icon.png"
+    ],
+    "macOS": {
+      "minimumSystemVersion": "11.0"
+    },
+    "resources": {
+      "../seu_net.py": "seu_net.py"
+    }
+  }
+}

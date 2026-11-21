@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>东南大学校园网</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div class="drag-bar"></div>
+
+<main>
+  <!-- 状态区 -->
+  <section class="status-card" id="statusCard">
+    <div class="status-top">
+      <div class="dot" id="statusDot"></div>
+      <div class="status-text">
+        <h1 id="statusTitle">正在检查</h1>
+        <p id="statusSub">连接校园网中…</p>
+      </div>
+    </div>
+
+    <div class="meta" id="meta">
+      <div class="meta-row"><span>网络</span><b id="mNetwork">—</b></div>
+      <div class="meta-row"><span>本机</span><b id="mIp">—</b></div>
+      <div class="meta-row"><span>账号</span><b id="mAccount">—</b></div>
+    </div>
+  </section>
+
+  <!-- 主操作 -->
+  <div class="actions">
+    <button class="primary" id="btnLogin">
+      <span class="spinner"></span><span class="label">立即认证</span>
+    </button>
+    <button class="ghost" id="btnRefresh" title="刷新状态">刷新</button>
+  </div>
+
+  <!-- 视图切换 -->
+  <nav class="tabs">
+    <button class="tab active" data-view="viewLog">日志</button>
+    <button class="tab" data-view="viewSettings">设置</button>
+  </nav>
+
+  <!-- 日志 -->
+  <section class="panel" id="viewLog">
+    <pre class="log" id="logBox">加载中…</pre>
+    <button class="link" id="btnOpenDir">在访达中打开</button>
+  </section>
+
+  <!-- 设置 -->
+  <section class="panel hidden" id="viewSettings">
+    <label class="field">
+      <span>宿舍宽带账号</span>
+      <input id="inAccount" type="text" placeholder="一卡通号" autocomplete="off" spellcheck="false">
+    </label>
+    <label class="field">
+      <span>宿舍宽带密码</span>
+      <input id="inPassword" type="password" placeholder="留空 = 不修改" autocomplete="off">
+    </label>
+
+    <div class="field">
+      <span>运营商</span>
+      <div class="segmented" id="carrierGroup">
+        <button data-v="" class="on">不确定</button>
+        <button data-v="1">移动</button>
+        <button data-v="2">电信</button>
+        <button data-v="3">联通</button>
+      </div>
+    </div>
+
+    <label class="check">
+      <input id="ckWlan" type="checkbox">
+      <span>教室用另一个号</span>
+    </label>
+
+    <div class="sub-fields hidden" id="wlanFields">
+      <label class="field">
+        <span>教室账号</span>
+        <input id="inWlanAccount" type="text" placeholder="教室登的号" autocomplete="off" spellcheck="false">
+      </label>
+      <label class="field">
+        <span>教室密码</span>
+        <input id="inWlanPassword" type="password" placeholder="留空 = 同宿舍" autocomplete="off">
+      </label>
+    </div>
+
+    <button class="primary small" id="btnSave">保存</button>
+    <p class="hint" id="saveHint"></p>
+  </section>
+</main>
+
+<script src="app.js"></script>
+</body>
+</html>

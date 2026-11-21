@@ -27,9 +27,10 @@ venv/
 .coverage
 htmlcov/
 
-# 打包产物（只忽略仓库根目录的，别误伤源码里的同名目录）
-/build/
-/dist/
+# Tauri / Rust 构建产物
+/src-tauri/target/
+/ui/node_modules/
+node_modules/
 
 # 编辑器 / 系统
 .DS_Store
@@ -38,8 +39,4 @@ desktop.ini
 .idea/
 .vscode/
 
-# 打包产物
-.venv-build/
-*.app/
-*.spec
-build/
+src-tauri/gen/

@@ -50,23 +50,44 @@ IS_MAC = sys.platform == "darwin"
 def _data_dir():
     """配置、日志、状态放哪儿。
 
-    三种情况：
-    - 打包成 macOS 的 .app：程序本体在 .app 包里（只读、随升级被替换），
-      所以数据要放到 ~/Library/Application Support/，不然一升级配置就没了。
-    - 打包成单文件 exe：数据跟着 exe 走，方便整个文件夹拷着用。
-    - 源码运行：数据就在脚本旁边。
+    优先级从高到低：
+    1. 环境变量 SEU_DATA_DIR（测试时不污染真实数据）
+    2. 已经存在 config.json 的目录——这条很重要：源码运行和打包运行必须
+       共用同一份配置，否则换个启动方式就「配置丢了」，用户会以为数据没了。
+    3. macOS 的 ~/Library/Application Support/（.app 升级不丢）
+    4. 源码运行时放脚本旁边
     """
+    override = os.environ.get("SEU_DATA_DIR")
+    if override:
+        try:
+            os.makedirs(override, exist_ok=True)
+            return override
+        except OSError:
+            pass
+
+    candidates = []
+    if IS_MAC:
+        candidates.append(os.path.expanduser(
+            "~/Library/Application Support/SEU-Net-AutoLogin"))
     if getattr(sys, "frozen", False):
-        if IS_MAC and ".app/Contents/MacOS" in sys.executable:
-            path = os.path.expanduser(
-                "~/Library/Application Support/SEU-Net-AutoLogin")
-            try:
-                os.makedirs(path, exist_ok=True)
-            except OSError:
-                return os.path.dirname(os.path.abspath(sys.executable))
+        candidates.append(os.path.dirname(os.path.abspath(sys.executable)))
+    else:
+        candidates.append(os.path.dirname(os.path.abspath(__file__)))
+
+    # 已经有配置的目录优先，避免同一台机器上两份配置来回打架
+    for path in candidates:
+        if os.path.exists(os.path.join(path, "config.json")):
             return path
-        return os.path.dirname(os.path.abspath(sys.executable))
-    return os.path.dirname(os.path.abspath(__file__))
+
+    for path in candidates:
+        try:
+            os.makedirs(path, exist_ok=True)
+            return path
+        except OSError:
+            continue
+    return os.path.dirname(os.path.abspath(sys.executable
+                                           if getattr(sys, "frozen", False)
+                                           else __file__))
 
 
 BASE_DIR = _data_dir()
@@ -2132,6 +2153,73 @@ def do_logout(portal, cfg, log=None):
     return True, text
 
 
+def _config_command(cfg, flags):
+    """输出界面能用的配置视图（不泄露密码明文）。"""
+    stations = []
+    for index, profile in enumerate(cfg.get("profiles") or []):
+        if not isinstance(profile, dict):
+            continue
+        password = str(profile.get("password") or "")
+        stations.append({
+            "name": _profile_label(profile, index),
+            "ssids": list(profile.get("ssids") or []),
+            "account": str(profile.get("account") or cfg.get("account") or ""),
+            "has_password": bool(password or cfg.get("password")),
+            "account_suffix": str(profile.get("account_suffix") or ""),
+            "priority": profile.get("priority", 100),
+        })
+    view = {
+        "account": str(cfg.get("account") or ""),
+        "has_password": bool(str(cfg.get("password") or "").strip()),
+        "stations": stations,
+        "config_path": CONFIG_PATH,
+        "data_dir": BASE_DIR,
+        "config_error": cfg.get("_config_error", ""),
+    }
+    print(json.dumps(view, ensure_ascii=False, indent=2))
+    return 0
+
+
+def _save_command():
+    """从 stdin 读一份 {account, password, carrier, wlan_account, wlan_password} 写配置。
+
+    密码留空表示「沿用旧密码」——界面上密码框是掩码，用户不改就不该把它清空。
+    """
+    try:
+        payload = json.loads(sys.stdin.read() or "{}")
+    except Exception as exc:
+        print(json.dumps({"ok": False, "error": "参数不是合法 JSON：%s" % exc},
+                         ensure_ascii=False))
+        return 1
+
+    old = load_config()
+    account = str(payload.get("account") or "").strip()
+    password = str(payload.get("password") or "")
+    wlan_account = str(payload.get("wlan_account") or "").strip()
+    wlan_password = str(payload.get("wlan_password") or "")
+    carrier = str(payload.get("carrier") or "")
+
+    if not account:
+        print(json.dumps({"ok": False, "error": "账号不能为空"}, ensure_ascii=False))
+        return 1
+    if not password:
+        # 留空 = 沿用原来的密码
+        password = str(old.get("password") or "")
+    if not password:
+        print(json.dumps({"ok": False, "error": "密码不能为空"}, ensure_ascii=False))
+        return 1
+
+    cfg = build_config(account, password, carrier, wlan_account, wlan_password)
+    try:
+        save_config(cfg)
+    except OSError as exc:
+        print(json.dumps({"ok": False, "error": "写入失败：%s" % exc},
+                         ensure_ascii=False))
+        return 1
+    print(json.dumps({"ok": True, "config_path": CONFIG_PATH}, ensure_ascii=False))
+    return 0
+
+
 def main(argv):
     flags = [arg for arg in argv if arg.startswith("--")]
     args = [arg for arg in argv if not arg.startswith("-")]
@@ -2152,6 +2240,15 @@ def main(argv):
         return 0
 
     cfg = load_config()
+
+    if command == "config":
+        # 给界面用的：读当前配置，密码只给长度不给明文。
+        # 前端只需要知道「填没填」，回填时用掩码占位，用户不改就不会覆盖。
+        return _config_command(cfg, flags)
+
+    if command == "save":
+        # 从 stdin 读 JSON 配置写盘（界面保存用）。密码传空串表示「保持原样」。
+        return _save_command()
 
     if command == "status":
         info = collect_status(cfg)

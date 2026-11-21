@@ -1,6 +1,10 @@
 # 东南大学校园网自动认证 —— 项目约定
 
-单文件为主：`seu_net.py`（纯标准库），`seu_tray.py`（macOS 托盘，需 pyobjc）。
+技术栈：Tauri 2（Rust 外壳 + HTML/CSS/JS 前端）+ Python 认证逻辑。
+
+- `seu_net.py` —— 认证、配置、日志。纯标准库，可独立使用，是所有逻辑的唯一来源
+- `src-tauri/src/main.rs` —— 窗口 + 托盘（同一进程，生命周期一致）+ 调 Python
+- `ui/` —— 前端，手写 HTML/CSS/JS，不引入 npm 框架
 
 ## 绝对不可违反
 
@@ -19,10 +23,11 @@
 
 ```bash
 python3 seu_net.py status      # 只读体检，改完先跑这个
-python3 seu_net.py doctor      # 环境自检（含 Tk 版本、自启状态）
-python3 seu_net.py gui         # 图形界面
-./build_app.sh                 # 打包 .app（用 .venv-build，不污染系统）
+python3 seu_net.py doctor      # 环境自检
+./build.sh                     # 打包 .app / .dmg（或 Windows 的 .msi）
 ```
+
+开发时跑 `cd src-tauri && cargo run` 看实时效果，热重载用 `cargo tauri dev`。
 
 必须同时验 Python 3.9（`/usr/bin/python3`）和 3.14（PATH 上的 `python3`）：
 自启写的是 `/usr/bin/python3`，界面用的是带新 Tk 的解释器。

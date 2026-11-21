@@ -1,348 +1,128 @@
-# 东南大学校园网自动认证（macOS / Windows）
+# 东南大学校园网自动认证
 
-开机自动完成校园网认证，不用每次打开浏览器、输一卡通号和密码。
+开机自动完成校园网认证。菜单栏常驻，状态一眼可见，不用打开浏览器输账号密码。
 
-一个 Python 文件，只用标准库。**macOS 上系统自带 Python 就能跑，不用装任何东西。**
-
-```bash
-python3 seu_net.py          # 认证
-python3 seu_net.py gui      # 打开小窗口
-```
-
-## 它解决什么
-
-宿舍连 `SEU-ISP`（走运营商宽带）和教室连 `SEU-WLAN`（走校园网），**账号写法不一样**：
-前者是 `一卡通号@cmcc`，后者是 `,0,一卡通号`。这台笔记本要带着到处跑，
-所以程序会在连上网的那一刻判断「这一份写法能不能用」，能用就记住，下次直接命中。
-
-判定方式不是猜 SSID，而是**真的提交一次并检查外网通不通**——门户说成功都不算数。
-
-```bash
-$ python3 seu_net.py status
-网络：读不到 SSID（未授权定位，不影响认证）
-本机：10.210.48.210    网关：10.210.0.1
-门户：http://w.seu.edu.cn:801
-门户状态：门户显示在线
-账号：213253274@unicom
-外网：通（HTTP 200，内容匹配）
-```
-
-## 快速开始
-
-**双击启动**：macOS 双击 `启动.command`，Windows 双击 `启动.cmd`，直接打开图形界面。
-
-第一次运行时窗口会**自动弹出设置框**，在界面里填一卡通号、密码、选一下运营商就能用——
-不用去编辑任何文件，存完会自动认证一次。
-
-命令行：
-
-```bash
-git clone <repo> && cd seu-network-autologin
-python3 seu_net.py init      # 终端里问三个问题，生成 config.json
-python3 seu_net.py           # 试一次认证，看到「认证完成」就成了
-python3 seu_net.py install   # 装成开机自启（每 60 秒检查一次）
-```
-
-> 第一次双击 `启动.command` 如果提示「无法验证开发者」，右键 →「打开」即可；
-> 或者 `chmod +x 启动.command` 一次。
-> Windows 上双击后如果一闪而过，说明缺 Python——脚本会提示去 python.org 装（记得勾选
-> “Add python.exe to PATH”）。
-
-### 窗口一片空白？（macOS 常见）
-
-macOS 系统自带的 Python 3（`/usr/bin/python3`）里带的是 **Tk 8.5**，它在 macOS 26 之后
-画不出 Label / Entry / Frame 这类控件——只有 Button 和 Radiobutton 能显示，所以窗口看起来是空的。
-
-启动脚本会自动跳过这类 Python，去找 Tk ≥ 8.6 的（自己装的 python.org 版本、Homebrew 的
-`python-tk` 都满足）。一个都找不到时它会**明确告诉你**，而不是开个空白窗口让你猜：
-
-```
-没找到能用的图形界面环境。
-原因：macOS 自带的 Python 3 使用 Tk 8.5，在新版 macOS 上画不出输入框和文字…
-装一个带新版 Tk 的 Python 就行（任选一种）：
-  · 命令行：brew install python-tk@3.12
-  · 或者到 https://www.python.org/downloads/ 下载安装 Python 3.12+
-不想装也可以先用命令行，功能一样：
-  python3 seu_net.py init      # 配置账号
-  python3 seu_net.py status    # 看状态
-  python3 seu_net.py           # 认证
-```
-
-`python3 seu_net.py doctor` 也会直接报出当前的 Tk 版本和是否可用。
+宿舍连 `SEU-ISP`（运营商宽带）和教室连 `SEU-WLAN`（校园网）的**账号写法不一样**，
+程序会自己试出能用哪一份，并记住这个网络该用哪份。
 
 ## 界面
 
+一个固定 380×520 的小窗口，深色 / 浅色跟随系统：
+
 ```
-校园网自动认证
-macOS / Windows 通用 · 按网络环境自动挑选账号写法
-
-┌──────────────────────────────────────────────┐
-│  已联网                                       │
-│  外网可用，不需要额外操作。                     │
-│                                               │
-│  网络   读不到（系统未授权定位，不影响认证）      │
-│  本机   10.210.48.210    网关 10.210.0.1       │
-│  门户   http://w.seu.edu.cn:801                │
-│  外网   HTTP 200，内容匹配                      │
-│  账号   213253274@unicom                       │
-└──────────────────────────────────────────────┘
-
-[立即认证] [注销下线] [刷新状态]
-[设置账号] [配置原文] [打开日志]
-
-最近日志
-──────────────────────────────────────────────
+┌──────────────────────────────┐
+│                              │
+│  ●  已联网                    │
+│     外网可用，无需操作          │
+│  ──────────────────────────  │
+│  网络        未识别（不影响认证）│
+│  本机         10.210.48.210   │
+│  账号         213252649       │
+│                              │
+│  [      立即认证      ] [刷新] │
+│                              │
+│  ┌──────┬──────┐             │
+│  │ 日志 │ 设置 │             │
+│  └──────┴──────┘             │
+│  ┌──────────────────────────┐│
+│  │ 2026-11-21 21:06:57 ...  ││
+│  └──────────────────────────┘│
+└──────────────────────────────┘
 ```
 
-「设置账号」随时可以改账号密码和运营商，改完直接保存。密码框是隐藏显示，
-保存在 `config.json` 里（文件权限 0600，只有你自己能读）。
+菜单栏图标：`✓` 已联网 / `!` 未认证 / `?` 不在校园网。
 
-## 命令
+**窗口和托盘是同一个进程**，所以生命周期一致：关窗口只是收起，托盘还在；
+点托盘「退出」才是真的全退。
 
-| 命令 | 作用 |
-| --- | --- |
-| `seu_net.py` | 前台认证，一直重试到成功或超时 |
-| `seu_net.py login --once` | 只试一轮（调试用） |
-| `seu_net.py status` | 看当前状态，**只读**，不改网络 |
-| `seu_net.py logout` | 让本机下线（本校门户实测会拒绝，见下文） |
-| `seu_net.py gui` | 打开小窗口 |
-| `seu_net.py init` | 首次配置向导 |
-| `seu_net.py install [--interval 秒]` | 装成开机自启 |
-| `seu_net.py uninstall` | 卸载自启 |
-| `seu_net.py doctor` | 环境自检，出问题先跑这个 |
+## 安装
+
+### 方式一：下载打包好的 app
+
+到 Releases 下载 `.dmg`，拖进「应用程序」。第一次打开提示「无法验证开发者」时右键 →「打开」。
+
+> app 需要系统里有 `python3`（macOS 装了 Command Line Tools 就有，`xcode-select --install`）。
+
+### 方式二：自己构建
+
+```bash
+git clone <repo> && cd seu-network-autologin
+./build.sh
+```
+
+需要 [Rust](https://rustup.rs)。Tauri CLI 会自动装。
 
 ## 配置
 
-跑 `init` 会生成 `config.json`，也可以照着 [config.example.json](config.example.json) 手写
-（支持 `//` 注释）。核心就两块：
+第一次打开会直接进「设置」，填账号密码即可。之后随时可以点「设置」改。
 
-```jsonc
-{
-  "account": "宿舍宽带的账号",
-  "password": "宿舍宽带的密码",
-  "profiles": [
-    {"name": "宿舍走宽带",   "ssids": ["SEU-ISP"],  "account_suffix": "@cmcc", "priority": 10},
-    {"name": "教室走校园网", "ssids": ["SEU-WLAN"], "account_prefix": ",0,", "account_suffix": "", "priority": 50}
-  ]
-}
+| 项 | 说明 |
+| --- | --- |
+| 宿舍宽带账号 | 一卡通号 |
+| 宿舍宽带密码 | 留空 = 不修改 |
+| 运营商 | 不确定就选默认，三家都试 |
+| 教室用另一个号 | 勾上会展开教室的账号密码 |
+
+**宿舍和教室不是同一个号时**，勾上最后一项单独填。密码留空则和宿舍共用。
+
+配置文件位置：
+
+```
+~/Library/Application Support/SEU-Net-AutoLogin/config.json     # macOS
+%APPDATA%\SEU-Net-AutoLogin\config.json                          # Windows
 ```
 
-条目怎么挑（**这是「宿舍/教室自动切换」的关键**）：
+每次保存都会留 3 份历史（`.bak.1` ~ `.bak.3`），改错了能翻回去。
 
-1. 上次在这个网络里成功过的那条 —— 记在 `state.json`，命中就不用试别的
-2. `ssids` 和当前 WiFi 名对得上的那条
-3. 剩下的按 `priority` 从小到大依次试
+## 命令行
 
-每一条都会真的提交一次，外网通了才认。**写错的后缀会被自动跳过，不会卡住认证。**
-
-> 所以就算你拿不准自己的账号该不该带 `@cmcc`，把两种都写上即可，程序自己会筛。
-
-### 宿舍和教室用的不是同一个号
-
-那就把教室那个号单独写进它自己的 profile，留空的项才会回退到顶层：
-
-```jsonc
-{
-  "account": "宿舍的号",      // 顶层 = 宿舍宽带用
-  "password": "宿舍的密码",
-  "profiles": [
-    {"name": "宿舍走宽带",   "ssids": ["SEU-ISP"],  "account_suffix": "@cmcc", "priority": 10},
-    {
-      "name": "教室走校园网",
-      "ssids": ["SEU-WLAN"],
-      "account_prefix": ",0,",
-      "account_suffix": "",
-      "account": "教室的号",   // ← 单独写在这里
-      "password": "教室的密码", // ← 密码也一样，留空则和宿舍共用
-      "priority": 50
-    }
-  ]
-}
-```
-
-界面上更省事：打开「设置账号」，勾上**「教室的校园网（SEU-WLAN）用另一个号」**，
-额度会展开出教室的账号和密码两格。
-
-`init` 向导第 4 问也会问到这一点，直接回车表示同一个号。
-
-## macOS 上读不到 WiFi 名（正常现象）
-
-从 macOS Sonoma 起，没有「定位服务」授权的程序读 WiFi 名会只拿到字面量 `<redacted>`。
-**这不影响认证**：程序会改用「网关 + 本机网段」来识别网络环境，并按上面第 1 步记住这个网络该用哪份配置。
-`doctor` 和 `status` 都会明确提示这一点，不是报错。
-
-想让它显示真实 WiFi 名，可以在
-`系统设置 → 隐私与安全性 → 定位服务` 里给终端（或 iTerm）授权——纯属好看，不授权也能正常用。
-
-## 菜单栏托盘（macOS）
-
-常驻菜单栏，图标显示当前状态，点开可以立即认证 / 注销 / 打开界面。
+图形界面之外，`seu_net.py` 也能单独用（纯标准库，无依赖）：
 
 ```bash
-python3 seu_tray.py --setup     # 第一次：建 .venv-tray 并装 pyobjc（约 20 MB）
-.venv-tray/bin/python seu_tray.py            # 直接跑
-.venv-tray/bin/python seu_tray.py --install  # 装成开机自启（开机就常驻）
+python3 seu_net.py status        # 看状态
+python3 seu_net.py status --json # 机器可读
+python3 seu_net.py               # 前台认证
+python3 seu_net.py login --once  # 只试一轮
+python3 seu_net.py logout        # 下线（本校门户实测会拒绝）
+python3 seu_net.py doctor        # 环境自检
+python3 seu_net.py install       # 开机自启（launchd / 计划任务）
+python3 seu_net.py uninstall     # 卸载自启
 ```
 
-托盘依赖 pyobjc，装在项目自己的 `.venv-tray/` 里（**不放 /tmp，重启不会丢**），
-主程序 `seu_net.py` 仍然零依赖——没装托盘也完全不影响认证。
-
-菜单栏显示：`✓ 已联网` / `! 未认证` / `? 不在校园网`。
-
-## 开机自启
-
-`seu_net.py install` 在 macOS 上写 `~/Library/LaunchAgents/cn.edu.seu.net.autologin.plist`，
-在 Windows 上建计划任务。两种模式：
-
-| 装什么 | 命令 | 说明 |
-| --- | --- | --- |
-| 轻量定时任务（默认） | `python3 seu_net.py install` | 只用标准库，最省事最不容易坏 |
-| 菜单栏托盘 | `.venv-tray/bin/python seu_tray.py --install` | 常驻菜单栏，能看能点 |
-
-**建议用默认那个**：托盘依赖 pyobjc，万一哪天 venv 坏了或 Python 升级，自启会静默失效；
-纯标准库的任务不会。想两者都要就都装（见下）。
-
-macOS 上的触发时机：
-
-- `RunAtLoad` —— 登录后立刻跑一次
-- `StartInterval` —— 每 60 秒检查一次（`--interval` 可改）
-- `WatchPaths` —— 盯住 `/var/run/resolv.conf` 和 `/etc/resolv.conf`，
-  **换 WiFi / 插网线 / DHCP 变化时立刻触发**，不用等那 60 秒。宿舍到教室这种切换差别明显
-- `ThrottleInterval=10` —— 网络抖动时不会连环触发
-
-> `WatchPaths` 只在文件被**替换（rename）**时触发，原地追加不算。系统更新 DNS 配置用的是 rename，
-> 所以有效；这条实测确认过。
-
-```bash
-python3 seu_net.py install --interval 90   # 改成每 90 秒
-python3 seu_net.py uninstall               # 停用
-```
-
-**共存**：托盘和定时任务可以同时装。两边都受单实例锁保护——谁先拿到谁做，
-另一个直接退出，不会抢着提交认证把对方的会话踢掉。
-
-Windows 上额外说明：任务计划在**用户登录后**才跑（不是锁屏阶段），并且
-`schtasks` 最小粒度是 1 分钟（`--interval` 小于 60 秒时按 1 分钟执行）。
-
-**装完怎么确认真的在跑**：
-
-```bash
-python3 seu_net.py status
-# 自启：已装载，每 60 秒检查一次，上次退出码 0
-```
-
-没装时会显示「自启：没装（跑 `seu_net.py install` 装上）」。`doctor` 里也会报这一项。
-
-## 日志
-
-`login.log`，超过 `log_max_kb`（默认 512 KB）就轮转成 `login.log.1`、`.2`、`.3`，
-最多留 3 份备份，更旧的删掉。**总占用上限 = 4 × 512 KB = 2 MB，不会无限长大。**
-
-同一条消息连续重复时只记一次，隔一分钟补一句「重复了几次」，避免断网时把日志刷爆。
-
-## 认证是怎么做的
-
-东南大学门户是 Drcom。认证由这几步组成：
+## 工作原理
 
 | 动作 | 请求 |
 | --- | --- |
 | 探测门户 | `GET http://w.seu.edu.cn/`（回 Dr.COM 页面即认定） |
-| 登录 | `GET :801/eportal/?c=ACSetting&a=Login&DDDDD=<账号>&upass=<密码>&wlanuserip=<本机IP>` |
-| 注销 | `GET :801/eportal/?c=ACSetting&a=Logout`（见下方说明） |
+| 登录 | `GET :801/eportal/?c=ACSetting&a=Login&DDDDD=<账号>&upass=<密码>` |
 | 查在线 | `GET http://w.seu.edu.cn/drcom/chkstatus?callback=dr1002` |
 
-> **注意端口不统一**：登录/注销在 801(http)/802(https)，在线状态查询在 **80**。
-> 在 801 上请求 `/drcom/chkstatus` 会 404，这是实测过的坑。
+几个实测的坑：
 
-> **注销接口在本校门户实测返回 `Logout failed.`**（页面是 `Dr.COMWebLoginID_2.htm` 失败页），
-> 即使本机明明在线。所以 `logout` 会如实报告「门户拒绝注销」而不是假装成功。
-> 影响：认证流程里「门户说在线但外网不通」时会先试一次注销，失败就照常重新登录——
-> 大多数情况重新登录本身就能救活会话。**`logout` 不能用来可靠地踢自己下线，
-> 想断开就直接关 WiFi。**
+- **端口不统一**：登录在 801(http)/802(https)，状态查询在 **80**。801 上查状态是 404。
+- **老接口已失效**：`?c=Portal&a=login` 现在返回 500，必须用 `?c=ACSetting&a=Login`。
+- **注销本校门户不支持**：返回 `Logout failed.`，即使确实在线。所以 `logout` 会如实报失败。
+- **「终端IP已在线」不是密码错**：那是本机已有会话，程序会继续校验外网通不通。
+- **macOS 读不到 SSID**：未授权定位时只给 `<redacted>`。不影响认证，用网关 + 网段识别环境。
 
-登录返回成功时门户会给一段 `Msg=0` 或成功页；失败是 `Msg=01;msga='用户名或密码错误！'`。
-但**这两种都不是最终判据**——程序会再请求一次外网，真通了才算认证成功
-（未认证时请求会被门户劫持成登录页，内容对不上）。
+**认证成功与否以外网是否真的通为准** —— 门户返回什么都不算数。
 
-## 用 `init` 不确定运营商时
-
-第三问问「宿舍宽带是哪一家」时直接回车，程序会把**移动 `@cmcc`、电信 `@dx`、联通 `@lt` 三条都写上**，
-认证时依次尝试，失败的那个自动跳过。所以不需要你事先搞清楚自己属于哪家。
-
-确认之后可以手动删掉用不上的两条，认证会更快（少一次无效尝试）。
-
-## 排查
-
-先跑 `python3 seu_net.py doctor`。常见情况：
-
-| 现象 | 原因与处理 |
-| --- | --- |
-| `未发现校园网门户` | 不在校园网，或 WiFi 还没连上。`wifi_auto_connect` 会主动去连 `wifi_order` 里的网络 |
-| `用户名或密码错误` | 一卡通号/密码不对，或这一条的 `account_suffix` 不适用——程序会自动换下一条 |
-| `门户显示在线` 但 `外网不通` | 会话卡住了，`login` 会先注销再重登 |
-| 读不到 SSID | macOS 未授权定位，正常，不影响认证（见上文） |
-| 装了自启但没生效 | `launchctl list \| grep seu` 看是否在跑；跑一次 `seu_net.py doctor` 确认账号已配 |
-
-## 打包成 .app（macOS）
-
-```bash
-./build_app.sh
-```
-
-产物在 `dist/东南大学校园网认证.app`，**双击就能用，不需要装 Python**（约 29 MB）。
-
-- 脚本会用 `.venv-build/` 自己装 PyInstaller，不污染系统环境
-- 第一次打开提示「无法验证开发者」时，右键 →「打开」
-- 拖进「应用程序」文件夹可长期使用
-
-**配置文件位置**：打包后配置不放在 app 包里（那样一升级就丢），而是放在
+## 项目结构
 
 ```
-~/Library/Application Support/SEU-Net-AutoLogin/config.json
+seu_net.py                认证逻辑（纯标准库，可独立使用）
+src-tauri/src/main.rs     Tauri 外壳：窗口 + 托盘 + 调 Python
+src-tauri/tauri.conf.json Tauri 配置
+ui/                       前端（HTML + CSS + 原生 JS，无框架）
+build.sh                  打包脚本
+AGENTS.md                 开发约定与踩坑记录
 ```
 
-`doctor` 会显示实际路径。
-
-## 配置备份
-
-每次保存配置（改账号、跑 `init`、界面里点保存）都会先把上一版备份成
-`config.json.bak.1` / `.bak.2` / `.bak.3`，保留最近 3 版。
-
-账号密码是手填的、又不在 git 里，误删就找不回来——有这几份备份就能翻回去。
-
-## 目录结构
-
-```
-seu_net.py            主程序（单文件，标准库，子命令切功能）
-seu_tray.py           macOS 菜单栏托盘（需要 pyobjc，可选）
-build_app.sh          打包成 .app
-启动.command          macOS 双击打开界面
-启动.cmd              Windows 双击打开界面
-config.example.json   配置模板（带注释）
-config.json           你的配置（含明文密码，已 gitignore）
-config.json.bak.*     配置的历史版本（自动备份，已 gitignore）
-state.json            记住哪个网络用哪份配置（自动生成，已 gitignore）
-login.log             日志（自动轮转，已 gitignore）
-login.lock            单实例锁（自动生成，已 gitignore）
-.venv-tray/           托盘依赖环境（--setup 时创建，已 gitignore）
-```
+旧的 tkinter + pyobjc 实现在 `legacy` 分支。
 
 ## 说明与免责
 
-- `config.json` 是明文密码，务必别提交、别外传。
-- 只在东南大学网络环境下验证过；其他学校的 Drcom 门户接口可能不同，但地址、参数、
-  后缀都能在 `config.json` 里改。
+- 配置文件是明文密码，已在 `.gitignore` 里，别提交。
+- 只在东南大学网络环境下验证过。
 - 仅供个人便利使用，请遵守学校的网络管理规定。
 - MIT 协议，见 [LICENSE](LICENSE)。
-
-## 相关项目
-
-| 项目 | 侧重 |
-| --- | --- |
-| [NN708/seu-wlan-login](https://github.com/NN708/seu-wlan-login) | 最流行的一键登录，面向一次性使用 |
-| [ChenYuWuAi/seu-autologin](https://github.com/ChenYuWuAi/seu-autologin) | Linux + systemd |
-| [geniezi/SEU-WLAN-LOGIN](https://github.com/geniezi/SEU-WLAN-LOGIN) | OpenWrt 路由器版 |
-| [Flynn-woo/seu-campus-autologin-windows](https://github.com/Flynn-woo/seu-campus-autologin-windows) | Windows 工程化完整 |
-
-本仓库定位：**macOS + Windows 同一套代码 + 按网络环境自动切换账号写法 +
-真实外网校验 + 有图形界面 + 日志自动轮转**。
