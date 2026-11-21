@@ -819,25 +819,51 @@ AUTH_FAIL_KEYS = (
 )
 
 
+# 门户在这种情况下返回「失败」，但其实不是账号密码的问题：
+# IP 上已经有一个会话了（通常就是自己正连着的那个）。不该判成认证被拒。
+ALREADY_ONLINE_KEYS = (
+    "终端ip已在线", "已在线", "已经在线", "ip已在线",
+    "you are already online", "already online",
+)
+
+
 def classify_login(text):
     """把门户的登录返回分成 ok / online / authfail / unknown。
 
-    成功时门户返回含 `Msg=0`，或回一段引用了 Dr.COMWebLoginID_3.htm 的成功页；
-    失败时是 `Msg=01;msga='用户名或密码错误！'; Login fail.`
+    门户的两种返回（都实测过）：
+      成功   Msg=0;...                                 或引用 Dr.COMWebLoginID_3.htm
+      失败   Msg=01;msga='用户名或密码错误！'; Login fail.
+      已在线 Msg=01;msga='终端IP已在线！'; Login fail.
+
+    判定顺序很重要：先看 Msg 码，再看文案。只看文案会漏——
+    「终端IP已在线！」里没有任何失败关键词，但 Msg=01 明确是没成功。
     """
     body = text or ""
     lowered = body.lower()
+    message = _portal_message(body)
+
+    # 1) 先认「已经在线」——它同时满足「失败」和「不该重试」两个特征
+    if any(key in (message + " " + body).lower() for key in ALREADY_ONLINE_KEYS):
+        return "online", message or "终端已在线"
+
+    # 2) 看门户给的 Msg 码：0 成功，非 0 一律失败
+    code_match = re.search(r"msg\s*=\s*'?(\d+)", lowered)
+    if code_match:
+        if code_match.group(1) == "0":
+            return "ok", message or "门户返回 Msg=0"
+        if any(key in lowered for key in AUTH_FAIL_KEYS):
+            return "authfail", message or ("Msg=%s" % code_match.group(1))
+        # Msg 非 0 但文案里没有明确的账号错误：算失败，但不该当「密码错」直接放弃
+        return "authfail", message or ("Msg=%s" % code_match.group(1))
+
+    # 3) 没有 Msg 码时看页面特征
+    if "webloginid_3" in lowered:
+        return "ok", message or "门户返回成功页"
     if any(key in lowered for key in AUTH_FAIL_KEYS):
-        detail = _portal_message(body) or "认证被拒绝"
-        return "authfail", detail
-    if "msga=" in lowered or "msg=" in lowered:
-        code = re.search(r"msg\s*=\s*'?(\d+)", lowered)
-        if code and code.group(1) != "0":
-            return "authfail", _portal_message(body) or ("Msg=%s" % code.group(1))
-    if "webloginid_3" in lowered or re.search(r"msg\s*=\s*'?0\b", lowered):
-        return "ok", _portal_message(body) or "门户返回成功"
+        return "authfail", message or "认证被拒绝"
     if "webloginid_2" in lowered:
-        return "authfail", _portal_message(body) or "门户返回失败页"
+        return "authfail", message or "门户返回失败页"
+
     uid = re.search(r"uid\s*=\s*'([^']*)'", body)
     if uid and uid.group(1):
         return "ok", "门户回显账号 %s" % uid.group(1)
@@ -1029,6 +1055,13 @@ def try_login_once(cfg, log, portal, profile, index, timeout, login_timeout):
     log("  提交认证（%s｜账号 %s）→ %s" % (label, creds["login_name"], detail))
     if state == "authfail":
         return "authfail", detail
+    if state == "online":
+        # 这个 IP 上已经有会话了（可能正是自己）。不算失败，也不是账号问题，
+        # 让调用方去校验外网到底通不通，别把这条当「密码错」直接放弃。
+        log("    门户提示该 IP 已在线，交给外网校验决定")
+        if wait_connectivity(cfg, log, timeout):
+            return "ok", detail
+        return "stuck", detail
 
     if wait_connectivity(cfg, log, timeout):
         return "ok", detail
@@ -1118,6 +1151,7 @@ def _authenticate_locked(cfg, log, once, max_wait):
             ordered = candidate_profiles(cfg, current_ssid(cfg), fingerprint)
             rejected = []
             skipped = 0
+            stuck = 0
             for position, (index, profile, why) in enumerate(ordered, 1):
                 state, detail = try_login_once(
                     cfg, log, portal, profile, index, timeout, login_timeout)
@@ -1129,12 +1163,18 @@ def _authenticate_locked(cfg, log, once, max_wait):
                     rejected.append((_profile_label(profile, index), detail))
                 elif state == "skip":
                     skipped += 1
+                elif state == "stuck":
+                    # 门户说这个 IP 已在线、外网却不通：会话卡住了，不是账号问题。
+                    # 这轮先记下，下一轮开头会先注销再重来。
+                    stuck += 1
                 if position < len(ordered):
                     log("    这一份没成，换下一份配置")
 
             # 没有任何一条配置真正提交过（全被跳过）说明配置有问题；
-            # 提交过的全被门户拒绝说明账号密码有问题。两种都不该继续重试。
-            if ordered and len(rejected) + skipped == len(ordered):
+            # 提交过的全被门户明确拒绝说明账号密码有问题。两种都不该继续重试。
+            # 但「IP 已在线」不算拒绝——那说明凭据可能没问题，只是会话卡住，
+            # 应该继续走重试/注销流程，而不是报「密码错」。
+            if ordered and stuck == 0 and len(rejected) + skipped == len(ordered):
                 forget_profile(fingerprint)
                 if rejected:
                     log("所有配置都被门户拒绝：%s" % "；".join("%s→%s" % r for r in rejected))
@@ -2146,6 +2186,17 @@ def main(argv):
     if command == "gui":
         return run_gui()
 
+    if command == "tray":
+        # 托盘在单独一个进程里跑：tkinter 和 AppKit 都要占主线程的消息循环，
+        # 塞进同一个进程会互相卡死。
+        try:
+            import seu_tray
+        except ImportError as exc:
+            print("托盘功能不可用：%s" % exc)
+            print("命令行和图形界面照常可用。")
+            return 1
+        return seu_tray.main(flags)
+
     if command == "init":
         if not first_run_wizard(force=True):
             if not (sys.stdin and sys.stdin.isatty()):
@@ -2191,10 +2242,52 @@ def main(argv):
         return 130
 
 
+def start_tray_sidecar():
+    """在后台拉起菜单栏托盘（独立进程）。
+
+    tkinter 和 AppKit 都要独占主线程的消息循环，放同一个进程会互相卡死，
+    所以托盘另起一个进程。用文件锁保证只会有一个托盘在跑——
+    双击两次 app 不会出现两个图标。
+    """
+    tray_pid_file = os.path.join(BASE_DIR, "tray.pid")
+    # 已经在跑就别重复起
+    try:
+        with open(tray_pid_file, "r") as fh:
+            old_pid = int(fh.read().strip() or 0)
+        if old_pid > 0:
+            os.kill(old_pid, 0)          # 只探测存活，不发信号
+            return True
+    except (OSError, ValueError):
+        pass
+
+    try:
+        import seu_tray  # noqa: F401  只是为了确认这个环境能用托盘
+    except Exception:
+        return False
+
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, os.path.join(BASE_DIR, "seu_tray.py")]
+            if not getattr(sys, "frozen", False)
+            else [sys.executable, "tray"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True,     # 和当前进程脱钩，关掉窗口托盘还在
+        )
+    except Exception:
+        return False
+    try:
+        with open(tray_pid_file, "w") as fh:
+            fh.write(str(proc.pid))
+    except OSError:
+        pass
+    return True
+
+
 if __name__ == "__main__":
     argv = sys.argv[1:]
-    # 打包成 .app 双击时没有任何命令行参数，也没有终端——这种时候默认开界面。
-    # 有终端且没给子命令时才走命令行认证。
+    # 打包成 .app 双击时没有任何命令行参数，也没有终端——这种时候开界面，
+    # 并且顺手把菜单栏托盘也拉起来（单独进程，各占各的消息循环）。
     if not argv and getattr(sys, "frozen", False) and (sys.stdin is None or not sys.stdin.isatty()):
+        start_tray_sidecar()
         argv = ["gui"]
     sys.exit(main(argv))
