@@ -48,6 +48,28 @@ python3 seu_net.py install   # 装成开机自启（每 60 秒检查一次）
 > Windows 上双击后如果一闪而过，说明缺 Python——脚本会提示去 python.org 装（记得勾选
 > “Add python.exe to PATH”）。
 
+### 窗口一片空白？（macOS 常见）
+
+macOS 系统自带的 Python 3（`/usr/bin/python3`）里带的是 **Tk 8.5**，它在 macOS 26 之后
+画不出 Label / Entry / Frame 这类控件——只有 Button 和 Radiobutton 能显示，所以窗口看起来是空的。
+
+启动脚本会自动跳过这类 Python，去找 Tk ≥ 8.6 的（自己装的 python.org 版本、Homebrew 的
+`python-tk` 都满足）。一个都找不到时它会**明确告诉你**，而不是开个空白窗口让你猜：
+
+```
+没找到能用的图形界面环境。
+原因：macOS 自带的 Python 3 使用 Tk 8.5，在新版 macOS 上画不出输入框和文字…
+装一个带新版 Tk 的 Python 就行（任选一种）：
+  · 命令行：brew install python-tk@3.12
+  · 或者到 https://www.python.org/downloads/ 下载安装 Python 3.12+
+不想装也可以先用命令行，功能一样：
+  python3 seu_net.py init      # 配置账号
+  python3 seu_net.py status    # 看状态
+  python3 seu_net.py           # 认证
+```
+
+`python3 seu_net.py doctor` 也会直接报出当前的 Tk 版本和是否可用。
+
 ## 界面
 
 ```

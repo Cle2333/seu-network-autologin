@@ -1105,6 +1105,16 @@ def run_gui():
         print("可以先用命令行：python3 %s status" % os.path.basename(__file__))
         return 1
 
+    # Tk 8.5（macOS 系统自带 Python 里的那个）在新版 macOS 上画不出 Label / Entry / Frame，
+    # 开出来是一大片空白。与其让用户对着空白窗口发懵，不如直接说清楚怎么换。
+    if float(tk.TkVersion) < 8.6:
+        print("这个 Python 的图形库太旧（Tk %.1f），窗口会显示为空白，已停止。" % tk.TkVersion)
+        print("换一个带新 Tk 的 Python 来开界面：brew install python-tk@3.12")
+        print("或者直接用命令行，功能完全一样：")
+        print("  python3 %s init     配置账号" % os.path.basename(__file__))
+        print("  python3 %s status   看状态" % os.path.basename(__file__))
+        return 1
+
     cfg = load_config()
     log = Logger(cfg, verbose=False)
 
@@ -1192,7 +1202,6 @@ def run_gui():
         dialog = tk.Toplevel(root)
         dialog.title("设置账号密码")
         dialog.configure(bg=COLORS["bg"])
-        dialog.geometry("460x400")
         dialog.transient(root)
         dialog.resizable(False, False)
 
@@ -1278,6 +1287,14 @@ def run_gui():
         cancel_btn.pack(side="right", padx=(0, 10))
 
         dialog.grab_set()
+        # 让对话框按内容自适应高度，并居中显示在主窗口上（不写死 460x400，
+        # 否则内容放不下时会露出主界面，看着像窗口坏了）
+        dialog.update_idletasks()
+        width = dialog.winfo_reqwidth()
+        height = dialog.winfo_reqheight()
+        x = root.winfo_rootx() + (root.winfo_width() - width) // 2
+        y = root.winfo_rooty() + (root.winfo_height() - height) // 3
+        dialog.geometry("%dx%d+%d+%d" % (width, height, max(x, 0), max(y, 0)))
         account_entry.focus_set()
         return dialog
 
@@ -1585,6 +1602,19 @@ def doctor(cfg, log):
     log("===== 环境自检 =====")
     log("平台：%s" % platform.platform())
     log("Python：%s（%s）" % (platform.python_version(), sys.executable))
+    # Tk 8.5 在新版 macOS 上画不出 Label / Entry / Frame（只有 Button 和 Radiobutton 能显示），
+    # 界面会是一片空白。这里主动报出来，省得用户以为是程序坏了。
+    try:
+        import tkinter
+        tk_version = float(tkinter.TkVersion)
+        if tk_version >= 8.6:
+            log("图形界面：Tk %.1f，正常" % tk_version)
+        else:
+            log("图形界面：Tk %.1f —— 版本太旧，窗口会显示为空白。" % tk_version)
+            log("  处理：换一个带新 Tk 的 Python 来开界面（brew install python-tk），"
+                "或直接用命令行。")
+    except Exception:
+        log("图形界面：没装 tkinter，只能用命令行")
     log("程序目录：%s" % BASE_DIR)
     log("配置文件：%s（%s）" % (CONFIG_PATH, "存在" if os.path.exists(CONFIG_PATH) else "不存在"))
     if cfg.get("_config_error"):
