@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "东南大学校园网",
+  "productName": "SEU-Net-AutoLogin",
   "version": "3.0.0",
   "identifier": "cn.edu.seu.net.autologin",
   "build": {
