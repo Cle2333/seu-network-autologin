@@ -27,18 +27,27 @@
   },
   "bundle": {
     "active": true,
-    "targets": [
-      "app",
-      "dmg"
-    ],
+    "targets": "all",
     "icon": [
-      "icons/icon.png"
+      "icons/icon.png",
+      "icons/icon.ico",
+      "icons/icon.icns"
     ],
     "macOS": {
       "minimumSystemVersion": "11.0"
     },
     "resources": {
       "../seu_net.py": "seu_net.py"
+    },
+    "windows": {
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper"
+      }
+    },
+    "linux": {
+      "deb": {
+        "depends": []
+      }
     }
   }
 }

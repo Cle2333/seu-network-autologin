@@ -55,7 +55,10 @@
 
 到 Releases 下载 `.dmg`，拖进「应用程序」。第一次打开提示「无法验证开发者」时右键 →「打开」。
 
-> app 需要系统里有 `python3`（macOS 装了 Command Line Tools 就有，`xcode-select --install`）。
+> **需要系统里有 Python 3**：认证逻辑跑在 `seu_net.py` 上。
+> - macOS：装 Command Line Tools 即可（`xcode-select --install`）
+> - Linux：一般自带
+> - Windows：到 [python.org](https://www.python.org/downloads/) 装，勾选 "Add python.exe to PATH" 
 
 ### 方式二：自己构建
 

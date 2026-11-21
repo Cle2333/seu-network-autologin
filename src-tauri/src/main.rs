@@ -419,13 +419,15 @@ fn autostart_enabled() -> bool {
 
 #[cfg(target_os = "windows")]
 fn autostart_enabled() -> bool {
-    Command::new("reg")
-        .args(["query", r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run", "/v", AUTOSTART_LABEL])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    // 用 run_hidden 避免无控制台程序弹黑窗
+    run_hidden(Command::new("reg").args([
+        "query",
+        r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
+        "/v",
+        AUTOSTART_LABEL,
+    ]))
+    .map(|o| o.status.success())
+    .unwrap_or(false)
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -438,20 +440,36 @@ fn autostart_enabled() -> bool {
 }
 
 #[tauri::command]
-fn autostart_state() -> bool {
-    autostart_enabled()
+async fn autostart_state() -> Result<bool, String> {
+    tauri::async_runtime::spawn_blocking(autostart_enabled)
+        .await
+        .map_err(|e| format!("后台任务异常：{e}"))
 }
 
 #[tauri::command]
-fn set_autostart(enabled: bool) -> Result<bool, String> {
-    if enabled {
-        enable_autostart()?;
-    } else {
-        disable_autostart()?;
-    }
-    Ok(autostart_enabled())
+async fn set_autostart(enabled: bool) -> Result<bool, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        if enabled {
+            enable_autostart()?;
+        } else {
+            disable_autostart()?;
+        }
+        Ok(autostart_enabled())
+    })
+    .await
+    .map_err(|e| format!("后台任务异常：{e}"))?
 }
 
+
+/// XML 特殊字符转义。路径里可能有 & < >（比如家目录叫 R&D），
+/// 不转义会写出畸形 plist，bootstrap 报个看不懂的错，而文件还在，
+/// 于是下次打开界面勾选框显示为「已开启」但实际上从没生效过。
+fn xml_escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
 
 #[cfg(target_os = "macos")]
 fn enable_autostart() -> Result<(), String> {
@@ -476,39 +494,22 @@ fn enable_autostart() -> Result<(), String> {
 </plist>
 "#,
         label = AUTOSTART_LABEL,
-        exe = exe.display()
+        exe = xml_escape(&exe.display().to_string())
     );
     std::fs::write(&path, plist).map_err(|e| format!("写 plist 失败：{e}"))?;
 
-    // 卸载旧的再装，避免已加载时改配置不生效
-    let uid = Command::new("id").arg("-u").output().ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .unwrap_or_default();
-    let target = format!("gui/{uid}/{AUTOSTART_LABEL}");
-    let _ = Command::new("launchctl").args(["bootout", &target]).output();
-    let out = Command::new("launchctl")
-        .args(["bootstrap", &format!("gui/{uid}"), path.to_str().unwrap_or("")])
-        .output()
-        .map_err(|e| format!("launchctl 调用失败：{e}"))?;
-    if !out.status.success() {
-        return Err(format!(
-            "launchctl bootstrap 失败：{}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
+    // 只写文件，不调 launchctl bootstrap。原因是 bootstrap 遇到 RunAtLoad=true
+    // 会立刻把程序跑起来，而此刻已经有一个实例在跑了——勾一下勾选框就多出
+    // 第二个托盘图标、第二个窗口。plist 放在 LaunchAgents 目录里，下次登录
+    // 系统会自动加载，本次运行完全不受影响。
     Ok(())
 }
 
 #[cfg(target_os = "macos")]
 fn disable_autostart() -> Result<(), String> {
-    let uid = Command::new("id").arg("-u").output().ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .unwrap_or_default();
-    let _ = Command::new("launchctl")
-        .args(["bootout", &format!("gui/{uid}/{AUTOSTART_LABEL}")])
-        .output();
+    // 同样不调 launchctl bootout：如果当前这个进程就是由该 LaunchAgent 启动的，
+    // bootout 会给它自己发 SIGTERM，取消勾选的那一刻程序自己被杀掉。
+    // 删掉 plist 就够了——下次登录不再启动。
     let path = macos_plist_path();
     if path.exists() {
         std::fs::remove_file(&path).map_err(|e| format!("删除 plist 失败：{e}"))?;
@@ -516,23 +517,36 @@ fn disable_autostart() -> Result<(), String> {
     Ok(())
 }
 
+/// 跑一个控制台程序，且不弹出窗口。
+///
+/// Windows 上本程序是 windows_subsystem="windows"（无控制台），此时启动 reg.exe
+/// 这类控制台程序会新开一个黑窗口闪一下。加 CREATE_NO_WINDOW 压制掉。
+fn run_hidden(cmd: &mut Command) -> std::io::Result<std::process::Output> {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd.output()
+}
+
 #[cfg(target_os = "windows")]
 fn enable_autostart() -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let out = Command::new("reg")
-        .args([
-            "add",
-            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
-            "/v",
-            AUTOSTART_LABEL,
-            "/t",
-            "REG_SZ",
-            "/d",
-            &format!("\"{}\"", exe.display()),
-            "/f",
-        ])
-        .output()
-        .map_err(|e| e.to_string())?;
+    // 路径必须加引号，否则含空格的路径会被 Run 键按空格拆开，登录时静默失败
+    let out = run_hidden(Command::new("reg").args([
+        "add",
+        r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
+        "/v",
+        AUTOSTART_LABEL,
+        "/t",
+        "REG_SZ",
+        "/d",
+        &format!("\"{}\"", exe.display()),
+        "/f",
+    ]))
+    .map_err(|e| e.to_string())?;
     if !out.status.success() {
         return Err(format!("写注册表失败：{}", String::from_utf8_lossy(&out.stderr).trim()));
     }
@@ -541,15 +555,13 @@ fn enable_autostart() -> Result<(), String> {
 
 #[cfg(target_os = "windows")]
 fn disable_autostart() -> Result<(), String> {
-    let _ = Command::new("reg")
-        .args([
-            "delete",
-            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
-            "/v",
-            AUTOSTART_LABEL,
-            "/f",
-        ])
-        .output();
+    let _ = run_hidden(Command::new("reg").args([
+        "delete",
+        r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
+        "/v",
+        AUTOSTART_LABEL,
+        "/f",
+    ]));
     Ok(())
 }
 
@@ -559,9 +571,17 @@ fn enable_autostart() -> Result<(), String> {
     let home = std::env::var("HOME").unwrap_or_default();
     let dir = PathBuf::from(home).join(".config/autostart");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    // Exec 的值会按空格拆词，路径含空格（比如 ~/Downloads/My Apps/）就会拆坏。
+    // 按 Desktop Entry 规范用双引号包起来，内部的 " ` $ \ 要转义。
+    let quoted = exe
+        .display()
+        .to_string()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('`', "\\`")
+        .replace('$', "\\$");
     let content = format!(
-        "[Desktop Entry]\nType=Application\nName=东南大学校园网\nExec={}\nX-GNOME-Autostart-enabled=true\n",
-        exe.display()
+        "[Desktop Entry]\nType=Application\nName=东南大学校园网\nExec=\"{quoted}\"\nX-GNOME-Autostart-enabled=true\n"
     );
     std::fs::write(dir.join(format!("{AUTOSTART_LABEL}.desktop")), content)
         .map_err(|e| e.to_string())
