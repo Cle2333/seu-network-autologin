@@ -28,8 +28,6 @@ const el = {
   carrierGroup: $('carrierGroup'),
   ckAutostart: $('ckAutostart'),
   autostartHint: $('autostartHint'),
-  ckDaemon: $('ckDaemon'),
-  daemonHint: $('daemonHint'),
 };
 
 let carrier = '';        // 当前选中的运营商
@@ -305,40 +303,6 @@ el.ckAutostart.addEventListener('change', async () => {
   }
 });
 
-// 后台自动认证任务：装的是 seu_net.py 的系统定时任务，跟界面开没开无关，
-// 所以退出应用后断网照样能自动重连。
-async function loadDaemon() {
-  try {
-    const info = await invoke('daemon_state');
-    el.ckDaemon.checked = !!(info && info.installed);
-    if (info && info.detail) {
-      el.daemonHint.textContent = info.detail;
-      el.daemonHint.className = 'hint';
-    }
-  } catch (err) {
-    el.daemonHint.textContent = '读取后台任务状态失败：' + err;
-    el.daemonHint.className = 'hint bad';
-  }
-}
-
-el.ckDaemon.addEventListener('change', async () => {
-  const want = el.ckDaemon.checked;
-  el.daemonHint.textContent = want ? '正在安装…' : '正在卸载…';
-  el.daemonHint.className = 'hint';
-  try {
-    await invoke('set_daemon', { enabled: want });
-    await loadDaemon();
-    el.daemonHint.textContent = want
-      ? '已安装：每 60 秒检查一次，退出本程序也会继续工作'
-      : '已卸载';
-    el.daemonHint.className = 'hint ok';
-  } catch (err) {
-    el.ckDaemon.checked = !want;
-    el.daemonHint.textContent = String(err);
-    el.daemonHint.className = 'hint bad';
-  }
-});
-
 // 托盘里点「立即认证」
 listen('tray-login', () => doLogin());
 
@@ -347,7 +311,6 @@ listen('tray-login', () => doLogin());
 refresh();
 loadConfig();
 loadAutostart();
-loadDaemon();
 
 // 定时刷新。窗口被隐藏（点关闭只是收起，托盘还在）时就别轮询了——
 // 每次刷新都要起 Python 进程，看不见的时候纯属浪费。

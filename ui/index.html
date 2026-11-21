@@ -51,19 +51,9 @@
   <section class="panel hidden" id="viewSettings">
     <label class="check">
       <input id="ckAutostart" type="checkbox">
-      <span>开机自动启动（登录后常驻菜单栏）</span>
+      <span>开机自动启动（登录后自动打开）</span>
     </label>
-    <p class="hint">关窗口不会退出，只是收起——点菜单栏图标能再打开。彻底退出点菜单栏里的「退出」。</p>
-
-    <div class="divider"></div>
-
-    <label class="check">
-      <input id="ckDaemon" type="checkbox">
-      <span>后台自动认证（退出界面也继续重连）</span>
-    </label>
-    <p class="hint">勾上会装一个系统后台任务，每 60 秒检查一次、换网络时立刻认证。
-      这样即使退出本程序，断网后也能自动连回来。</p>
-    <p class="hint" id="daemonHint"></p>
+    <p class="hint">退出程序后不会残留任何后台进程——菜单栏图标在 = 在运行，图标消失 = 真的停了。</p>
 
     <div class="divider"></div>
 

@@ -452,42 +452,6 @@ fn set_autostart(enabled: bool) -> Result<bool, String> {
     Ok(autostart_enabled())
 }
 
-// ---- 后台自动认证任务 ----
-//
-// 和上面的「开机启动界面」是两件事：这个装的是 seu_net.py 的定时任务，
-// 由系统在后台每 60 秒跑一次 `login --quiet`，跟界面开没开无关。
-// 所以退出应用后仍然会自动重连——靠的就是它。
-
-#[tauri::command]
-async fn daemon_state(state: tauri::State<'_, Backend>) -> Result<serde_json::Value, String> {
-    blocking(&state, |backend| {
-        let out = run_backend(&backend, &["status", "--json"], None);
-        let info: serde_json::Value = serde_json::from_str(&out.stdout)
-            .map_err(|e| format!("{e}"))?;
-        Ok(info.get("autostart").cloned().unwrap_or(serde_json::Value::Null))
-    })
-    .await
-}
-
-#[tauri::command]
-async fn set_daemon(state: tauri::State<'_, Backend>, enabled: bool) -> Result<serde_json::Value, String> {
-    let cmd = if enabled { "install" } else { "uninstall" };
-    blocking(&state, move |backend| {
-        require_ready(&backend)?;
-        let out = run_backend(&backend, &[cmd], None);
-        if out.code != 0 {
-            return Err(format!(
-                "{}失败：{}",
-                if enabled { "安装" } else { "卸载" },
-                (out.stderr.trim().is_empty() && out.stdout.trim().is_empty())
-                    .then(|| "未知错误".to_string())
-                    .unwrap_or_else(|| format!("{}{}", out.stdout.trim(), out.stderr.trim()))
-            ));
-        }
-        Ok(serde_json::json!({ "ok": true, "output": out.stdout }))
-    })
-    .await
-}
 
 #[cfg(target_os = "macos")]
 fn enable_autostart() -> Result<(), String> {
@@ -628,8 +592,6 @@ fn main() {
             open_data_dir,
             autostart_state,
             set_autostart,
-            daemon_state,
-            set_daemon,
         ])
         .setup(|app| {
             let backend = locate_backend(app.handle());
@@ -661,8 +623,10 @@ fn main() {
             }
         })
         .on_window_event(|window, event| {
-            // 点关闭按钮不退出程序，只是把窗口藏起来——托盘还在，随时能点回来。
-            // 真正退出靠托盘的「退出」。
+            // 关窗口 = 最小化到托盘。进程继续跑，菜单栏图标还在——
+            // 所以「图标在 = 在运行」这个语义是成立的。
+            // 真的退出只能通过托盘右键菜单里的「退出」，那条路径会 exit(0)，
+            // 不留任何后台进程。
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
                 let _ = window.hide();
