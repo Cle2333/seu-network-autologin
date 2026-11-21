@@ -31,6 +31,7 @@ import os
 import platform
 import queue
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -45,14 +46,42 @@ VERSION = "2.0"
 IS_WIN = os.name == "nt"
 IS_MAC = sys.platform == "darwin"
 
-# 打包成 exe / app 后 __file__ 指向临时解包目录，配置和日志要跟着程序本身走
-if getattr(sys, "frozen", False):
-    BASE_DIR = os.path.dirname(os.path.abspath(sys.executable))
-else:
-    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+def _data_dir():
+    """配置、日志、状态放哪儿。
+
+    三种情况：
+    - 打包成 macOS 的 .app：程序本体在 .app 包里（只读、随升级被替换），
+      所以数据要放到 ~/Library/Application Support/，不然一升级配置就没了。
+    - 打包成单文件 exe：数据跟着 exe 走，方便整个文件夹拷着用。
+    - 源码运行：数据就在脚本旁边。
+    """
+    if getattr(sys, "frozen", False):
+        if IS_MAC and ".app/Contents/MacOS" in sys.executable:
+            path = os.path.expanduser(
+                "~/Library/Application Support/SEU-Net-AutoLogin")
+            try:
+                os.makedirs(path, exist_ok=True)
+            except OSError:
+                return os.path.dirname(os.path.abspath(sys.executable))
+            return path
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+BASE_DIR = _data_dir()
 
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
 STATE_PATH = os.path.join(BASE_DIR, "state.json")
+
+
+def resource_path(name):
+    """找一个随程序发布的只读资源（比如图标）。
+
+    打包后这些文件被解到 sys._MEIPASS 指向的临时目录，源码运行时就在脚本旁边。
+    """
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, name)
 
 # GUI 子进程启动控制台程序时不要弹窗口（Windows）
 NO_WINDOW = 0x08000000 if IS_WIN else 0
@@ -197,7 +226,33 @@ def save_config(cfg):
     with os.fdopen(handle, "w", encoding="utf-8") as fh:
         json.dump(data, fh, ensure_ascii=False, indent=2)
         fh.write("\n")
+    _backup_existing_config()
     os.replace(tmp, CONFIG_PATH)
+
+
+CONFIG_BACKUP_COUNT = 3
+
+
+def _backup_existing_config():
+    """覆盖前先把现有配置留一份 .bak.N。
+
+    账号密码是手填的、丢了很烦（而且它不在 git 里，误删就找不回来）。
+    保存新配置前自动留 3 份历史，什么时候都能翻回去。
+    """
+    if not os.path.exists(CONFIG_PATH):
+        return
+    try:
+        oldest = "%s.bak.%d" % (CONFIG_PATH, CONFIG_BACKUP_COUNT)
+        if os.path.exists(oldest):
+            os.remove(oldest)
+        for index in range(CONFIG_BACKUP_COUNT - 1, 0, -1):
+            src = "%s.bak.%d" % (CONFIG_PATH, index)
+            if os.path.exists(src):
+                os.replace(src, "%s.bak.%d" % (CONFIG_PATH, index + 1))
+        shutil.copy2(CONFIG_PATH, CONFIG_PATH + ".bak.1")
+        os.chmod(CONFIG_PATH + ".bak.1", 0o600)
+    except OSError:
+        pass
 
 
 def has_credentials(cfg):
@@ -2137,4 +2192,9 @@ def main(argv):
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    argv = sys.argv[1:]
+    # 打包成 .app 双击时没有任何命令行参数，也没有终端——这种时候默认开界面。
+    # 有终端且没给子命令时才走命令行认证。
+    if not argv and getattr(sys, "frozen", False) and (sys.stdin is None or not sys.stdin.isatty()):
+        argv = ["gui"]
+    sys.exit(main(argv))

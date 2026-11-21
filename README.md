@@ -283,15 +283,44 @@ python3 seu_net.py status
 | 读不到 SSID | macOS 未授权定位，正常，不影响认证（见上文） |
 | 装了自启但没生效 | `launchctl list \| grep seu` 看是否在跑；跑一次 `seu_net.py doctor` 确认账号已配 |
 
+## 打包成 .app（macOS）
+
+```bash
+./build_app.sh
+```
+
+产物在 `dist/东南大学校园网认证.app`，**双击就能用，不需要装 Python**（约 29 MB）。
+
+- 脚本会用 `.venv-build/` 自己装 PyInstaller，不污染系统环境
+- 第一次打开提示「无法验证开发者」时，右键 →「打开」
+- 拖进「应用程序」文件夹可长期使用
+
+**配置文件位置**：打包后配置不放在 app 包里（那样一升级就丢），而是放在
+
+```
+~/Library/Application Support/SEU-Net-AutoLogin/config.json
+```
+
+`doctor` 会显示实际路径。
+
+## 配置备份
+
+每次保存配置（改账号、跑 `init`、界面里点保存）都会先把上一版备份成
+`config.json.bak.1` / `.bak.2` / `.bak.3`，保留最近 3 版。
+
+账号密码是手填的、又不在 git 里，误删就找不回来——有这几份备份就能翻回去。
+
 ## 目录结构
 
 ```
 seu_net.py            主程序（单文件，标准库，子命令切功能）
 seu_tray.py           macOS 菜单栏托盘（需要 pyobjc，可选）
+build_app.sh          打包成 .app
 启动.command          macOS 双击打开界面
 启动.cmd              Windows 双击打开界面
 config.example.json   配置模板（带注释）
 config.json           你的配置（含明文密码，已 gitignore）
+config.json.bak.*     配置的历史版本（自动备份，已 gitignore）
 state.json            记住哪个网络用哪份配置（自动生成，已 gitignore）
 login.log             日志（自动轮转，已 gitignore）
 login.lock            单实例锁（自动生成，已 gitignore）
