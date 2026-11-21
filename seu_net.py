@@ -419,6 +419,99 @@ class Logger(object):
 
 
 # ============================================================================
+# 单实例锁
+# ============================================================================
+
+LOCK_PATH = os.path.join(BASE_DIR, "login.lock")
+
+
+class InstanceLock(object):
+    """同一时刻只让一个实例真的去认证。
+
+    为什么必须有：开机自启的任务每 60 秒起一个进程，而你可能同时开着图形界面点
+    「立即认证」。两边各提交一次认证，会互相把对方的会话踢掉，日志也会写乱。
+    这里用操作系统级的文件锁（不是 pid 文件那种有竞态的写法）——
+    进程退出（哪怕崩溃）时内核会自动释放，不会留下死锁。
+    """
+
+    def __init__(self, path=None):
+        self.path = path or LOCK_PATH
+        self._handle = None
+
+    def acquire(self):
+        """拿到锁返回 True，已有别的实例在跑返回 False。"""
+        try:
+            handle = open(self.path, "a+")
+        except OSError:
+            # 锁文件都建不了（目录只读之类）：不阻塞认证，但记下来
+            return True
+        try:
+            if IS_WIN:
+                import msvcrt
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (OSError, IOError):
+            handle.close()
+            return False
+        # 把当前进程信息写进去，方便排查「是谁占着锁」
+        try:
+            handle.seek(0)
+            handle.truncate()
+            handle.write("pid=%d\nstart=%s\n" % (os.getpid(), time.strftime("%Y-%m-%d %H:%M:%S")))
+            handle.flush()
+        except OSError:
+            pass
+        self._handle = handle
+        return True
+
+    def release(self):
+        if self._handle is None:
+            return
+        try:
+            if IS_WIN:
+                import msvcrt
+                self._handle.seek(0)
+                msvcrt.locking(self._handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(self._handle.fileno(), fcntl.LOCK_UN)
+        except Exception:
+            pass
+        try:
+            self._handle.close()
+        except Exception:
+            pass
+        self._handle = None
+
+    def __enter__(self):
+        return self.acquire()
+
+    def __exit__(self, *_exc):
+        self.release()
+        return False
+
+
+def lock_holder():
+    """锁现在被谁占着（给 status / doctor 用）。返回说明文字，没人占返回空串。"""
+    if not os.path.exists(LOCK_PATH):
+        return ""
+    try:
+        with open(LOCK_PATH, "r", encoding="utf-8", errors="replace") as fh:
+            content = fh.read().strip().replace("\n", "  ")
+    except OSError:
+        return ""
+    # 试着拿一下：能拿到就说明现在没人在跑（锁文件只是残留）
+    probe = InstanceLock()
+    if probe.acquire():
+        probe.release()
+        return ""
+    return content
+
+
+# ============================================================================
 # 平台层：SSID / IP / 网关 / 连网
 # ============================================================================
 
@@ -822,6 +915,37 @@ def remember_profile(fingerprint, index):
     save_state(state)
 
 
+HEALTHY_HEARTBEAT_SECONDS = 3600
+
+
+def note_healthy(log, fingerprint, reason):
+    """外网本来就是通的：只在「刚变通」或每满一小时时记一行。
+
+    自启任务一分钟跑一次，每次都写「外网已通」既没信息量又把日志撑大。
+    状态记在 state.json，重启也不会重复刷。
+    """
+    state = load_state()
+    healthy = state.get("healthy") or {}
+    last_at = float(healthy.get("at") or 0)
+    now = time.time()
+    same_network = healthy.get("fingerprint") == fingerprint
+    if same_network and (now - last_at) < HEALTHY_HEARTBEAT_SECONDS:
+        return
+    if same_network:
+        log("外网持续可用（%s）" % reason)
+    else:
+        log("外网已通，不需要认证（%s，%s）" % (reason, fingerprint))
+    state["healthy"] = {"fingerprint": fingerprint, "at": now}
+    save_state(state)
+
+
+def clear_healthy():
+    """从通变成不通时清掉标记，下次通了会立刻记一行。"""
+    state = load_state()
+    if state.pop("healthy", None) is not None:
+        save_state(state)
+
+
 def forget_profile(fingerprint):
     state = load_state()
     (state.get("profiles") or {}).pop(fingerprint, None)
@@ -862,6 +986,25 @@ def authenticate(cfg, log, once=False, max_wait=None):
         log("配置不完整：缺少一卡通号或密码。运行 `seu_net.py init` 补上，或打开 gui 里的设置。")
         return 3
 
+    # 自启任务和手动操作可能撞在一起，只让一个去认证。
+    # 拿不到锁说明别人正在做同一件事，这边直接退出即可（不是失败）。
+    instance = InstanceLock()
+    if not instance.acquire():
+        holder = lock_holder()
+        log("已有另一个实例正在认证%s，本次跳过"
+            % (("（%s）" % holder) if holder else ""))
+        return 0
+    try:
+        return _authenticate_locked(cfg, log, once, max_wait)
+    finally:
+        instance.release()
+
+
+def _authenticate_locked(cfg, log, once, max_wait):
+    if not has_credentials(cfg):
+        log("配置不完整：缺少一卡通号或密码。运行 `seu_net.py init` 补上，或打开 gui 里的设置。")
+        return 3
+
     timeout = float(cfg.get("request_timeout_seconds", 4))
     login_timeout = float(cfg.get("login_timeout_seconds", 12))
     interval = max(1.0, float(cfg.get("retry_interval_seconds", 10)))
@@ -873,13 +1016,17 @@ def authenticate(cfg, log, once=False, max_wait=None):
     fingerprint = network_fingerprint(cfg, ssid)
     reason = "网络 %s" % ssid if ssid else "SSID 不可读（未授权定位），用网关识别"
 
-    # 已经能上网就什么都不做。定时任务每 60 秒跑一次，不先短路的话
-    # 每次都会重新提交认证、把日志刷满，还可能把刚稳定的会话踢掉。
+    # 已经能上网就什么都不做。定时任务每分钟跑一次，不先短路的话
+    # 每次都会重新提交认证、把刚稳定的会话踢掉。
     reachable, _detail = connectivity_ok(cfg, timeout)
     if reachable:
-        log("外网已通，不需要认证（%s，%s）" % (reason, fingerprint))
+        # 自启任务一分钟一次，每次都记一行「外网已通」就是纯噪音（一天 1400 行、
+        # 内容完全一样）。只在状态发生变化时写，平时最多每小时留一条心跳。
+        note_healthy(log, fingerprint, reason)
         return 0
 
+    # 从「通」变成「不通」，这条值得记
+    clear_healthy()
     log("===== 开始认证｜%s｜%s =====" % (reason, fingerprint))
 
     started = time.time()
@@ -1486,6 +1633,9 @@ def run_gui():
         ]
         if info["uid"]:
             lines.append("账号   %s" % info["uid"])
+        auto = autostart_status()
+        lines.append("自启   %s" % ("开" if auto["running"] else "关")
+                     + "（%s）" % auto["detail"][:50])
         info_label.configure(text="\n".join(lines))
 
         lines_tail = log.tail(200)
@@ -1497,7 +1647,8 @@ def run_gui():
 
     def set_busy(busy, text=""):
         state["busy"] = busy
-        for button in (button_login, button_logout, button_refresh, button_config, button_log):
+        for button in (button_login, button_logout, button_refresh,
+                       button_settings, button_config, button_log):
             button.set_enabled(not busy)
         if text:
             status_label.configure(text=text, fg=COLORS["accent"])
@@ -1586,10 +1737,52 @@ def run_gui():
 # ============================================================================
 
 LAUNCHD_LABEL = "cn.edu.seu.net.autologin"
+WINDOWS_TASK = "SEU-Net-AutoLogin"
 
 
 def _launchd_plist_path():
     return os.path.expanduser("~/Library/LaunchAgents/%s.plist" % LAUNCHD_LABEL)
+
+
+def autostart_status():
+    """开机自启现在是装了还是没装、跑得怎么样。给 status / doctor / GUI 用。
+
+    返回 dict：installed / running / detail / last_run
+    """
+    info = {"installed": False, "running": False, "detail": "", "last_run": ""}
+    if IS_MAC:
+        path = _launchd_plist_path()
+        if not os.path.exists(path):
+            info["detail"] = "没装（跑 `seu_net.py install` 装上）"
+            return info
+        info["installed"] = True
+        code, out, err = run_result(["launchctl", "print", "gui/%d/%s"
+                                     % (os.getuid(), LAUNCHD_LABEL)])
+        if code != 0:
+            info["detail"] = ("配置在 %s，但 launchd 没加载它"
+                              "（跑一次 install 重新装载）" % path)
+            return info
+        info["running"] = True
+        interval = ""
+        # launchctl print 的格式是 `run interval = 15 seconds`
+        match = re.search(r"run interval\s*=\s*(\d+)\s*second", out)
+        if match:
+            interval = "每 %s 秒检查一次" % match.group(1)
+        info["detail"] = "已装载" + (("，" + interval) if interval else "")
+        exit_code = re.search(r"last exit code\s*=\s*(-?\d+)", out)
+        if exit_code:
+            info["detail"] += "，上次退出码 %s" % exit_code.group(1)
+        return info
+
+    code, out, _err = run_result(["schtasks", "/Query", "/TN", WINDOWS_TASK],
+                                 encoding="gbk")
+    if code != 0:
+        info["detail"] = "没装（跑 `seu_net.py install` 装上）"
+        return info
+    info["installed"] = True
+    info["running"] = "Ready" in out or "就绪" in out or "正在运行" in out
+    info["detail"] = "计划任务已注册" + ("" if info["running"] else "（当前不是就绪状态）")
+    return info
 
 
 def _pick_python():
@@ -1622,9 +1815,45 @@ def _autostart_command():
     return [os.path.abspath(_pick_python()), os.path.abspath(__file__)]
 
 
-def install_autostart(interval=60, log=print):
+# 这几个文件会在网络切换（换 WiFi、插网线、DHCP 续约）时被系统重写。
+# 用 WatchPaths 盯住它们，换网络那一刻就能立刻触发认证，
+# 不用等 StartInterval 那个周期——宿舍到教室这种场景差别很明显。
+#
+# 注意：WatchPaths 只在文件被**替换（rename）**时触发，原地改写内容不会触发。
+# 实测确认过：`mv` 覆盖会触发，`>>` 追加和 `touch` 不会。
+# configd 更新 resolv.conf 用的是写临时文件再 rename，正好符合。
+WATCH_PATHS = [
+    "/var/run/resolv.conf",
+    "/etc/resolv.conf",
+]
+
+
+def install_autostart(interval=60, log=print, tray=False):
+    """装开机自启。
+
+    tray=True 时装的是菜单栏托盘（需要 pyobjc，且不设 StartInterval——
+    托盘自己常驻、自己定时刷新）。默认装的是轻量的 `login --quiet` 定时任务，
+    只用标准库，不会因为某个第三方依赖没装而静默失效。
+    """
     launcher = _autostart_command()
     if IS_MAC:
+        if tray:
+            # 托盘需要 pyobjc，而 pyobjc 未必装在系统自带的 Python 上，
+            # 所以这里必须用「当前正在运行、已经能 import AppKit 的那个解释器」，
+            # 不能用 _pick_python()（它会优先挑 /usr/bin/python3，那里没有 pyobjc）。
+            code, _out, _err = run_result(
+                [sys.executable, "-c", "import AppKit"])
+            if code != 0:
+                log("装托盘需要 pyobjc，但当前解释器（%s）里没有。" % sys.executable)
+                log("先装上：%s -m pip install pyobjc-framework-Cocoa" % sys.executable)
+                log("装好后再跑一次 `python3 seu_tray.py --install`。")
+                return 1
+            tray_script = os.path.join(BASE_DIR, "seu_tray.py")
+            args = [os.path.abspath(sys.executable), tray_script]
+            extra = ""
+        else:
+            args = launcher + ["login", "--quiet"]
+            extra = "  <key>StartInterval</key><integer>%d</integer>\n" % int(interval)
         plist = """<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -1635,20 +1864,28 @@ def install_autostart(interval=60, log=print):
 {args}
   </array>
   <key>RunAtLoad</key><true/>
-  <key>StartInterval</key><integer>{interval}</integer>
-  <key>StandardOutPath</key><string>{out}</string>
-  <key>StandardErrorPath</key><string>{err}</string>
+{extra}  <!-- 换 WiFi / 插网线 / DHCP 变化时这几个文件会被重写，盯住它们就能在网络
+       切换的瞬间触发认证，不用干等周期。 -->
+  <key>WatchPaths</key>
+  <array>
+{watch}
+  </array>
+  <!-- ThrottleInterval 防止网络抖动时连环触发：两次启动至少隔 10 秒 -->
+  <key>ThrottleInterval</key><integer>10</integer>
+  <!-- 程序自己会写 login.log（带轮转）。这里的 stdout/stderr 只装崩溃堆栈这类
+       意外输出，指向 /dev/null 避免一年下来堆成一个几百 MB 的文件；
+       真出问题看 login.log 和 doctor 就够了。 -->
+  <key>StandardOutPath</key><string>/dev/null</string>
+  <key>StandardErrorPath</key><string>/dev/null</string>
   <key>ProcessType</key><string>Background</string>
   <key>LowPriorityIO</key><true/>
 </dict>
 </plist>
 """.format(
             label=LAUNCHD_LABEL,
-            args="\n".join("    <string>%s</string>" % part
-                           for part in launcher + ["login", "--quiet"]),
-            interval=int(interval),
-            out=os.path.join(BASE_DIR, "launchd.out.log"),
-            err=os.path.join(BASE_DIR, "launchd.err.log"))
+            args="\n".join("    <string>%s</string>" % part for part in args),
+            extra=extra,
+            watch="\n".join("    <string>%s</string>" % p for p in WATCH_PATHS))
         path = _launchd_plist_path()
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as fh:
@@ -1663,21 +1900,30 @@ def install_autostart(interval=60, log=print):
             return 1
         run(["launchctl", "enable", "gui/%d/%s" % (uid, LAUNCHD_LABEL)])
         log("已安装开机自启：%s" % path)
-        log("每 %d 秒检查一次；日志在 %s" % (int(interval), os.path.join(BASE_DIR, "login.log")))
+        if tray:
+            log("开机后常驻菜单栏，点图标可以用；状态每 30 秒自动刷新。")
+        else:
+            log("每 %d 秒检查一次；日志在 %s"
+                % (int(interval), os.path.join(BASE_DIR, "login.log")))
         log("要停用跑 `%s uninstall`" % os.path.basename(launcher[-1]))
         return 0
 
-    # Windows：登录后触发 + 每 N 分钟
+    # Windows：登录后触发 + 每 N 分钟。
+    # --interval 的语义统一为「秒」，但 schtasks 最小粒度是 1 分钟，
+    # 所以这里向上折算成分钟，并在提示里写清楚实际是多少。
     task = "SEU-Net-AutoLogin"
+    minutes = max(1, int(round(int(interval) / 60.0)))
     run(["schtasks", "/Delete", "/TN", task, "/F"])
     cmd = "%s login --quiet" % " ".join('"%s"' % part for part in launcher)
     code, out, err = run_result(
         ["schtasks", "/Create", "/TN", task, "/TR", cmd, "/SC", "MINUTE",
-         "/MO", str(int(interval)), "/F", "/RL", "LIMITED"], encoding="gbk")
+         "/MO", str(minutes), "/F", "/RL", "LIMITED"], encoding="gbk")
     if code != 0:
         log("创建计划任务 %s 失败（退出码 %d）：%s" % (task, code, (err or out).strip()[:200]))
         return 1
-    log("已创建计划任务 %s（每 %d 分钟）" % (task, int(interval)))
+    log("已创建计划任务 %s（每 %d 分钟检查一次）" % (task, minutes))
+    if int(interval) < 60:
+        log("  注意：Windows 计划任务最小间隔是 1 分钟，所以实际按每 1 分钟执行。")
     return 0
 
 
@@ -1740,6 +1986,10 @@ def doctor(cfg, log):
     ok, detail = connectivity_ok(cfg, float(cfg.get("request_timeout_seconds", 4)))
     log("外网：%s（%s）" % ("通" if ok else "不通", detail))
 
+    auto = autostart_status()
+    log("开机自启：%s" % auto["detail"])
+    holder = lock_holder()
+    log("当前认证进程：%s" % (holder or "无"))
     total = Logger(cfg, verbose=False).total_bytes()
     log("日志占用：%.1f KB（上限 %s KB × %s 份）"
         % (total / 1024.0, cfg.get("log_max_kb"), int(cfg.get("log_backup_count", 3)) + 1))
@@ -1810,6 +2060,8 @@ def main(argv):
 
     if command == "status":
         info = collect_status(cfg)
+        auto = autostart_status()
+        info["autostart"] = auto
         if "--json" in flags:
             print(json.dumps(info, ensure_ascii=False, indent=2))
             return 0
@@ -1822,6 +2074,10 @@ def main(argv):
             print("账号：%s" % info["uid"])
         print("外网：%s（%s）" % ("通" if info["connectivity"] else "不通",
                                 info["connectivity_detail"][:90]))
+        print("自启：%s" % auto["detail"])
+        holder = lock_holder()
+        if holder:
+            print("当前有一个认证进程在跑：%s" % holder)
         return 0
 
     if command == "logout":

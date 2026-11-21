@@ -17,6 +17,7 @@ __pycache__/
 *.pyc
 *.egg-info/
 .venv/
+.venv-tray/
 venv/
 .pytest_cache/
 .mypy_cache/

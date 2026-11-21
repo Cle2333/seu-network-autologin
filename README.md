@@ -174,20 +174,64 @@ macOS / Windows 通用 · 按网络环境自动挑选账号写法
 想让它显示真实 WiFi 名，可以在
 `系统设置 → 隐私与安全性 → 定位服务` 里给终端（或 iTerm）授权——纯属好看，不授权也能正常用。
 
+## 菜单栏托盘（macOS）
+
+常驻菜单栏，图标显示当前状态，点开可以立即认证 / 注销 / 打开界面。
+
+```bash
+python3 seu_tray.py --setup     # 第一次：建 .venv-tray 并装 pyobjc（约 20 MB）
+.venv-tray/bin/python seu_tray.py            # 直接跑
+.venv-tray/bin/python seu_tray.py --install  # 装成开机自启（开机就常驻）
+```
+
+托盘依赖 pyobjc，装在项目自己的 `.venv-tray/` 里（**不放 /tmp，重启不会丢**），
+主程序 `seu_net.py` 仍然零依赖——没装托盘也完全不影响认证。
+
+菜单栏显示：`✓ 已联网` / `! 未认证` / `? 不在校园网`。
+
 ## 开机自启
 
-`seu_net.py install` 在 macOS 上写 `~/Library/LaunchAgents/cn.edu.seu.net.autologin.plist`
-（`RunAtLoad` + 每 60 秒），在 Windows 上建一个每 60 分钟的任务计划。
+`seu_net.py install` 在 macOS 上写 `~/Library/LaunchAgents/cn.edu.seu.net.autologin.plist`，
+在 Windows 上建计划任务。两种模式：
 
-用的是 `/usr/bin/python3` 这种稳定路径，不写死带版本号的工具链目录，升级后不会静默失效。
+| 装什么 | 命令 | 说明 |
+| --- | --- | --- |
+| 轻量定时任务（默认） | `python3 seu_net.py install` | 只用标准库，最省事最不容易坏 |
+| 菜单栏托盘 | `.venv-tray/bin/python seu_tray.py --install` | 常驻菜单栏，能看能点 |
+
+**建议用默认那个**：托盘依赖 pyobjc，万一哪天 venv 坏了或 Python 升级，自启会静默失效；
+纯标准库的任务不会。想两者都要就都装（见下）。
+
+macOS 上的触发时机：
+
+- `RunAtLoad` —— 登录后立刻跑一次
+- `StartInterval` —— 每 60 秒检查一次（`--interval` 可改）
+- `WatchPaths` —— 盯住 `/var/run/resolv.conf` 和 `/etc/resolv.conf`，
+  **换 WiFi / 插网线 / DHCP 变化时立刻触发**，不用等那 60 秒。宿舍到教室这种切换差别明显
+- `ThrottleInterval=10` —— 网络抖动时不会连环触发
+
+> `WatchPaths` 只在文件被**替换（rename）**时触发，原地追加不算。系统更新 DNS 配置用的是 rename，
+> 所以有效；这条实测确认过。
 
 ```bash
 python3 seu_net.py install --interval 90   # 改成每 90 秒
 python3 seu_net.py uninstall               # 停用
 ```
 
+**共存**：托盘和定时任务可以同时装。两边都受单实例锁保护——谁先拿到谁做，
+另一个直接退出，不会抢着提交认证把对方的会话踢掉。
+
 Windows 上额外说明：任务计划在**用户登录后**才跑（不是锁屏阶段），并且
-`schtasks` 计划任务的最小粒度是 1 分钟。
+`schtasks` 最小粒度是 1 分钟（`--interval` 小于 60 秒时按 1 分钟执行）。
+
+**装完怎么确认真的在跑**：
+
+```bash
+python3 seu_net.py status
+# 自启：已装载，每 60 秒检查一次，上次退出码 0
+```
+
+没装时会显示「自启：没装（跑 `seu_net.py install` 装上）」。`doctor` 里也会报这一项。
 
 ## 日志
 
@@ -243,12 +287,15 @@ Windows 上额外说明：任务计划在**用户登录后**才跑（不是锁�
 
 ```
 seu_net.py            主程序（单文件，标准库，子命令切功能）
+seu_tray.py           macOS 菜单栏托盘（需要 pyobjc，可选）
 启动.command          macOS 双击打开界面
 启动.cmd              Windows 双击打开界面
 config.example.json   配置模板（带注释）
 config.json           你的配置（含明文密码，已 gitignore）
 state.json            记住哪个网络用哪份配置（自动生成，已 gitignore）
 login.log             日志（自动轮转，已 gitignore）
+login.lock            单实例锁（自动生成，已 gitignore）
+.venv-tray/           托盘依赖环境（--setup 时创建，已 gitignore）
 ```
 
 ## 说明与免责
