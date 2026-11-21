@@ -23,12 +23,7 @@
         "transparent": false
       }
     ],
-    "withGlobalTauri": true,
-    "trayIcon": {
-      "iconPath": "icons/tray.png",
-      "iconAsTemplate": true,
-      "menuOnLeftClick": false
-    }
+    "withGlobalTauri": true
   },
   "bundle": {
     "active": true,

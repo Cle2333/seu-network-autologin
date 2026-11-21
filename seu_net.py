@@ -51,11 +51,12 @@ def _data_dir():
     """配置、日志、状态放哪儿。
 
     优先级从高到低：
-    1. 环境变量 SEU_DATA_DIR（测试时不污染真实数据）
-    2. 已经存在 config.json 的目录——这条很重要：源码运行和打包运行必须
-       共用同一份配置，否则换个启动方式就「配置丢了」，用户会以为数据没了。
+    1. 环境变量 SEU_DATA_DIR —— 测试时指定，绝不碰真实数据
+    2. 脚本自己所在目录已经有 config.json —— 说明这是一套独立的部署/测试环境，
+       配置就该跟脚本放一起。这条也让「拷一份到临时目录做测试」天然隔离。
     3. macOS 的 ~/Library/Application Support/（.app 升级不丢）
-    4. 源码运行时放脚本旁边
+       —— 但只有那里真的有配置时才用它，避免源码运行和打包版各存一份
+    4. 脚本旁边 / 可执行文件旁边
     """
     override = os.environ.get("SEU_DATA_DIR")
     if override:
@@ -65,6 +66,11 @@ def _data_dir():
         except OSError:
             pass
 
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    if not getattr(sys, "frozen", False) and os.path.exists(
+            os.path.join(script_dir, "config.json")):
+        return script_dir
+
     candidates = []
     if IS_MAC:
         candidates.append(os.path.expanduser(
@@ -72,7 +78,7 @@ def _data_dir():
     if getattr(sys, "frozen", False):
         candidates.append(os.path.dirname(os.path.abspath(sys.executable)))
     else:
-        candidates.append(os.path.dirname(os.path.abspath(__file__)))
+        candidates.append(script_dir)
 
     # 已经有配置的目录优先，避免同一台机器上两份配置来回打架
     for path in candidates:
@@ -2180,6 +2186,17 @@ def _config_command(cfg, flags):
     return 0
 
 
+def _existing_wlan_password(cfg):
+    """从现有配置里取出 SEU-WLAN 那条自己单独设的密码（没有就返回空）。"""
+    for profile in cfg.get("profiles") or []:
+        if not isinstance(profile, dict):
+            continue
+        names = [str(n).upper() for n in (profile.get("ssids") or [])]
+        if any("SEU-WLAN" in name for name in names):
+            return str(profile.get("password") or "")
+    return ""
+
+
 def _save_command():
     """从 stdin 读一份 {account, password, carrier, wlan_account, wlan_password} 写配置。
 
@@ -2189,6 +2206,12 @@ def _save_command():
         payload = json.loads(sys.stdin.read() or "{}")
     except Exception as exc:
         print(json.dumps({"ok": False, "error": "参数不是合法 JSON：%s" % exc},
+                         ensure_ascii=False))
+        return 1
+    # null / [] / "abc" 都是合法 JSON，但后面 .get() 会抛 AttributeError，
+    # 前端就只能看到一坨 traceback
+    if not isinstance(payload, dict):
+        print(json.dumps({"ok": False, "error": "参数必须是一个 JSON 对象"},
                          ensure_ascii=False))
         return 1
 
@@ -2208,6 +2231,12 @@ def _save_command():
     if not password:
         print(json.dumps({"ok": False, "error": "密码不能为空"}, ensure_ascii=False))
         return 1
+
+    # 教室密码留空同样表示「沿用旧密码」。
+    # 不处理的话，build_config 不会给 SEU-WLAN 那条写 password，
+    # 登录时会回退到宿舍密码——用户只是改个运营商，教室的密码就被顶掉了。
+    if wlan_account and not wlan_password:
+        wlan_password = _existing_wlan_password(old)
 
     cfg = build_config(account, password, carrier, wlan_account, wlan_password)
     try:

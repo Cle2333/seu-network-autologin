@@ -40,7 +40,6 @@ function setStatus(kind, title, sub) {
 }
 
 function applyStatus(s) {
-  const autostart = s.autostart && s.autostart.running;
   if (s.connectivity) {
     setStatus('ok', '已联网', '外网可用，无需操作');
   } else if (s.online) {
@@ -51,25 +50,31 @@ function applyStatus(s) {
     setStatus('', '不在校园网', s.online_detail || '未发现认证门户');
   }
 
+  // 配置文件本身读不了的时候必须说出来，否则用户会一直重输正确的账号，
+  // 却不知道是文件坏了。
+  if (s.config_error) {
+    setStatus('bad', '配置文件有问题', String(s.config_error).slice(0, 70));
+  }
+
   el.network.textContent = s.ssid_readable ? s.ssid : '未识别（不影响认证）';
   el.ip.textContent = s.ip || '—';
   el.account.textContent = s.uid || (s.credentials ? '已配置' : '未配置');
 
   // 账号没配的时候，直接把主按钮变成引导
-  if (!s.credentials) {
-    el.btnLogin.querySelector('.label').textContent = '去填账号';
-  } else {
-    el.btnLogin.querySelector('.label').textContent = '立即认证';
-  }
+  el.btnLogin.querySelector('.label').textContent =
+    s.credentials ? '立即认证' : '去填账号';
 }
 
 async function refresh() {
   if (busy) return;
+  busy = true;              // 先占位，否则连点两次会并发两个 Python 进程
   try {
     const s = await invoke('get_status');
     applyStatus(s);
   } catch (err) {
     setStatus('bad', '检查失败', String(err).slice(0, 60));
+  } finally {
+    busy = false;
   }
   loadLog();
 }
@@ -97,23 +102,41 @@ function setBusy(on) {
   if (on) setStatus('busy', '正在处理', '稍等一下…');
 }
 
+// 退出码 → 提示语。用查表而不是嵌套三元，漏掉的情况也有兜底。
+const LOGIN_MESSAGES = {
+  0: ['ok', '认证完成', '外网已连通'],
+  1: ['bad', '等待超时', '网络还没起来，稍后会自动重试'],
+  2: ['bad', '账号或密码被拒绝', '请检查账号、密码和运营商'],
+  3: ['bad', '配置不完整', '去「设置」补上账号密码'],
+  130: ['bad', '已取消', ''],
+};
+
 async function doLogin() {
   if (busy) return;
-  const status = await invoke('get_status').catch(() => null);
+  busy = true;                 // 先占位再 await，否则连点会并发两次认证
+  let status = null;
+  try {
+    status = await invoke('get_status');
+  } catch {
+    /* 拿不到状态就直接尝试认证 */
+  }
   if (status && !status.credentials) {
+    busy = false;
     switchView('viewSettings');
     el.inAccount.focus();
     return;
   }
+
   setBusy(true);
   try {
     const result = await invoke('login_once');
-    if (result.ok) {
-      setStatus('ok', '认证完成', '外网已连通');
+    if (result.skipped) {
+      // 自启任务正在认证，这次只是排到队尾，别报「成功」
+      setStatus('busy', '已有认证在进行', '等它跑完再看结果');
     } else {
-      const code = result.code;
-      const msg = code === 2 ? '账号或密码被拒绝' : (code === 1 ? '等待超时' : '认证未成功');
-      setStatus('bad', msg, '详情见日志');
+      const [kind, title, sub] =
+        LOGIN_MESSAGES[result.code] || ['bad', '认证未成功', '详情见日志'];
+      setStatus(kind, title, sub);
     }
   } catch (err) {
     setStatus('bad', '出错了', String(err).slice(0, 60));
@@ -173,9 +196,18 @@ async function saveConfig() {
     el.inAccount.focus();
     return;
   }
+  // 勾了「教室用另一个号」就必须填账号，否则后端会当成「和宿舍一样」，
+  // 保存后勾选状态自己消失，用户以为存上了其实没有。
+  if (el.ckWlan.checked && !el.inWlanAccount.value.trim()) {
+    el.hint.textContent = '勾选了「教室用另一个号」，请填教室的账号';
+    el.hint.className = 'hint bad';
+    el.inWlanAccount.focus();
+    return;
+  }
   setBusy(true);
   el.hint.textContent = '';
   el.hint.className = 'hint';
+  let saved = false;
   try {
     const payload = {
       account,
@@ -186,10 +218,10 @@ async function saveConfig() {
     };
     const result = await invoke('save_config', { payload });
     if (result.ok) {
+      saved = true;
       el.hint.textContent = '已保存';
       el.hint.className = 'hint ok';
       await loadConfig();
-      refresh();
     } else {
       el.hint.textContent = result.error || '保存失败';
       el.hint.className = 'hint bad';
@@ -199,6 +231,9 @@ async function saveConfig() {
     el.hint.className = 'hint bad';
   } finally {
     setBusy(false);
+    // refresh 开头有 if (busy) return，必须等 setBusy(false) 之后再调，
+    // 否则状态卡会一直停在「正在处理」直到下一次轮询。
+    if (saved) refresh();
   }
 }
 
@@ -245,4 +280,16 @@ listen('tray-login', () => doLogin());
 
 refresh();
 loadConfig();
-setInterval(refresh, 30000);
+
+// 定时刷新。窗口被隐藏（点关闭只是收起，托盘还在）时就别轮询了——
+// 每次刷新都要起 Python 进程，看不见的时候纯属浪费。
+let pollTimer = setInterval(refresh, 30000);
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    clearInterval(pollTimer);
+    pollTimer = null;
+  } else if (!pollTimer) {
+    refresh();
+    pollTimer = setInterval(refresh, 30000);
+  }
+});

@@ -18,9 +18,16 @@ use tauri::{
 };
 
 /// 调用 Python 脚本时用的解释器与脚本路径，启动时确定。
+/// 派生 Clone 是为了能拷进 spawn_blocking 里跑，不占主线程。
+#[derive(Clone)]
 struct Backend {
     python: String,
     script: PathBuf,
+    /// 数据目录（config.json / login.log 所在处），启动时问一次就缓存下来，
+    /// 避免读个日志还要额外跑一个 Python 进程。
+    data_dir: PathBuf,
+    /// 脚本路径本身是否可用；不可用时每个命令都直接报这个错
+    problem: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -57,10 +64,13 @@ fn locate_backend(app: &tauri::AppHandle) -> Backend {
         candidates.push(cwd.join("seu_net.py"));
     }
 
-    let script = candidates
-        .into_iter()
-        .find(|p| p.exists())
-        .unwrap_or_else(|| PathBuf::from("seu_net.py"));
+    let found = candidates.into_iter().find(|p| p.exists());
+    let problem = if found.is_none() {
+        Some("找不到 seu_net.py：打包时应该放在 Resources 里，源码运行时在项目根目录".to_string())
+    } else {
+        None
+    };
+    let script = found.unwrap_or_else(|| PathBuf::from("seu_net.py"));
 
     // 优先用打包时指定的解释器；找不到就退回系统自带的。
     let mut python = std::env::var("SEU_PYTHON").unwrap_or_default();
@@ -80,11 +90,35 @@ fn locate_backend(app: &tauri::AppHandle) -> Backend {
             }
         }
     }
+    let mut problem = problem;
     if python.is_empty() {
+        problem = Some("找不到 python3，请先安装（macOS: xcode-select --install）".to_string());
         python = "python3".to_string();
     }
 
-    Backend { python, script }
+    let mut backend = Backend {
+        python,
+        script,
+        data_dir: PathBuf::new(),
+        problem,
+    };
+    // 启动时问一次数据目录并缓存，省掉每次读日志都多起一个 Python
+    if backend.problem.is_none() {
+        let probe = run_backend(&backend, &["config", "--json"], None);
+        if let Ok(view) = serde_json::from_str::<serde_json::Value>(&probe.stdout) {
+            if let Some(dir) = view.get("data_dir").and_then(|d| d.as_str()) {
+                backend.data_dir = PathBuf::from(dir);
+            }
+        }
+        if backend.data_dir.as_os_str().is_empty() {
+            backend.data_dir = backend
+                .script
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| PathBuf::from("."));
+        }
+    }
+    backend
 }
 
 fn run_backend(backend: &Backend, args: &[&str], stdin: Option<&str>) -> CommandOutput {
@@ -135,94 +169,146 @@ fn run_backend(backend: &Backend, args: &[&str], stdin: Option<&str>) -> Command
 }
 
 // ---------------------------------------------------------------- 命令（前端调用）
+//
+// 全部是 async + spawn_blocking：Tauri 对同步命令是在主线程跑的，
+// 而这里每个命令都要起一个 Python 进程、可能要等几秒（门户探测、认证），
+// 同步实现会把整个窗口冻住。放进阻塞线程池就没这问题。
+
+/// 把 Backend 拷一份丢进阻塞线程池里执行。
+async fn blocking<T, F>(backend: &Backend, job: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce(Backend) -> Result<T, String> + Send + 'static,
+{
+    let backend = backend.clone();
+    tauri::async_runtime::spawn_blocking(move || job(backend))
+        .await
+        .map_err(|e| format!("后台任务异常：{e}"))?
+}
+
+fn require_ready(backend: &Backend) -> Result<(), String> {
+    match &backend.problem {
+        Some(msg) => Err(msg.clone()),
+        None => Ok(()),
+    }
+}
 
 #[tauri::command]
-fn backend_path(state: tauri::State<'_, Backend>) -> String {
-    format!("{} {}", state.python, state.script.display())
+async fn backend_path(state: tauri::State<'_, Backend>) -> Result<String, String> {
+    Ok(format!("{} {}", state.python, state.script.display()))
 }
 
 /// 跑 `seu_net.py status --json`，前端拿到结构化状态。
 #[tauri::command]
-fn get_status(state: tauri::State<'_, Backend>) -> Result<serde_json::Value, String> {
-    let out = run_backend(&state, &["status", "--json"], None);
-    if out.stdout.trim().is_empty() {
-        // 拿不到 JSON 时把 stderr 和退出码一起报出来，不然前端只看到一句
-        // 「EOF while parsing」，根本不知道是路径错了还是脚本崩了
-        return Err(format!(
-            "状态输出为空（退出码 {}）：{}",
-            out.code,
-            out.stderr.trim()
-        ));
-    }
-    serde_json::from_str(&out.stdout).map_err(|e| {
-        format!(
-            "状态解析失败：{}｜原始输出前 120 字：{}",
-            e,
-            out.stdout.chars().take(120).collect::<String>()
-        )
+async fn get_status(state: tauri::State<'_, Backend>) -> Result<serde_json::Value, String> {
+    blocking(&state, |backend| {
+        require_ready(&backend)?;
+        let out = run_backend(&backend, &["status", "--json"], None);
+        if out.stdout.trim().is_empty() {
+            return Err(format!(
+                "状态输出为空（退出码 {}）：{}",
+                out.code,
+                out.stderr.trim()
+            ));
+        }
+        serde_json::from_str(&out.stdout).map_err(|e| {
+            format!(
+                "状态解析失败：{}｜原始输出前 120 字：{}",
+                e,
+                out.stdout.chars().take(120).collect::<String>()
+            )
+        })
     })
+    .await
 }
 
 /// 跑 `seu_net.py config --json`，拿脱敏后的配置。
 #[tauri::command]
-fn get_config(state: tauri::State<'_, Backend>) -> Result<serde_json::Value, String> {
-    let out = run_backend(&state, &["config", "--json"], None);
-    serde_json::from_str(&out.stdout).map_err(|e| format!("配置解析失败：{e}"))
+async fn get_config(state: tauri::State<'_, Backend>) -> Result<serde_json::Value, String> {
+    blocking(&state, |backend| {
+        require_ready(&backend)?;
+        let out = run_backend(&backend, &["config", "--json"], None);
+        serde_json::from_str(&out.stdout).map_err(|e| {
+            format!("配置解析失败：{}｜{}", e, out.stderr.trim())
+        })
+    })
+    .await
 }
 
 /// 保存配置。密码留空表示沿用原来的。
 #[tauri::command]
-fn save_config(
+async fn save_config(
     state: tauri::State<'_, Backend>,
     payload: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     let text = serde_json::to_string(&payload).map_err(|e| e.to_string())?;
-    let out = run_backend(&state, &["save"], Some(&text));
-    let parsed: serde_json::Value = serde_json::from_str(&out.stdout)
-        .map_err(|_| format!("保存失败：{}", out.stderr.trim()))?;
-    Ok(parsed)
+    blocking(&state, move |backend| {
+        require_ready(&backend)?;
+        let out = run_backend(&backend, &["save"], Some(&text));
+        serde_json::from_str(&out.stdout)
+            .map_err(|_| format!("保存失败：{}", out.stderr.trim()))
+    })
+    .await
 }
 
 /// 立即认证一次。
+///
+/// 注意：seu_net.py 在「已有别的实例在认证」时会返回 0（本次跳过），
+/// 那不是真的认证成功，所以不能只看退出码——要看输出里有没有「跳过」。
 #[tauri::command]
-fn login_once(state: tauri::State<'_, Backend>) -> Result<serde_json::Value, String> {
-    let out = run_backend(&state, &["login", "--once"], None);
-    Ok(serde_json::json!({
-        "ok": out.code == 0,
-        "code": out.code,
-        "message": if out.stdout.trim().is_empty() { out.stderr } else { out.stdout },
-    }))
+async fn login_once(state: tauri::State<'_, Backend>) -> Result<serde_json::Value, String> {
+    blocking(&state, |backend| {
+        require_ready(&backend)?;
+        let out = run_backend(&backend, &["login", "--once"], None);
+        let message = if out.stdout.trim().is_empty() {
+            out.stderr.clone()
+        } else {
+            out.stdout.clone()
+        };
+        let skipped = out.stdout.contains("已有另一个实例正在认证");
+        Ok(serde_json::json!({
+            "ok": out.code == 0 && !skipped,
+            "skipped": skipped,
+            "code": out.code,
+            "message": message,
+        }))
+    })
+    .await
 }
 
 #[tauri::command]
-fn logout(state: tauri::State<'_, Backend>) -> Result<serde_json::Value, String> {
-    let out = run_backend(&state, &["logout"], None);
-    Ok(serde_json::json!({
-        "ok": out.code == 0,
-        "message": if out.stdout.trim().is_empty() { out.stderr } else { out.stdout },
-    }))
+async fn logout(state: tauri::State<'_, Backend>) -> Result<serde_json::Value, String> {
+    blocking(&state, |backend| {
+        require_ready(&backend)?;
+        let out = run_backend(&backend, &["logout"], None);
+        Ok(serde_json::json!({
+            "ok": out.code == 0,
+            "message": if out.stdout.trim().is_empty() { out.stderr } else { out.stdout },
+        }))
+    })
+    .await
 }
 
-/// 读日志尾部（含轮转文件）。
+/// 读日志尾部（含轮转文件）。数据目录在启动时已经缓存，这里不再多起进程。
 #[tauri::command]
 fn read_log(state: tauri::State<'_, Backend>, lines: Option<usize>) -> String {
     let limit = lines.unwrap_or(120);
-    let base = match state.script.parent() {
-        Some(dir) => dir.to_path_buf(),
-        None => PathBuf::from("."),
-    };
-    // 数据目录可能是 ~/Library/Application Support/...，先问一次 Python 拿准
-    let probe = run_backend(&state, &["config", "--json"], None);
-    let dir = serde_json::from_str::<serde_json::Value>(&probe.stdout)
-        .ok()
-        .and_then(|v| v.get("data_dir").and_then(|d| d.as_str()).map(PathBuf::from))
-        .unwrap_or(base);
+    let dir = state.data_dir.clone();
+    // 日志名可配，但默认 login.log；把最新的几份按顺序拼起来
+    let mut names: Vec<String> = Vec::new();
+    for index in (1..=3).rev() {
+        names.push(format!("login.log.{index}"));
+    }
+    names.push("login.log".to_string());
 
     let mut content = String::new();
-    for name in ["login.log.1", "login.log"] {
+    for name in names {
         if let Ok(text) = std::fs::read_to_string(dir.join(name)) {
             content.push_str(&text);
         }
+    }
+    if content.is_empty() {
+        return String::new();
     }
     let tail: Vec<&str> = content.lines().rev().take(limit).collect();
     tail.into_iter().rev().collect::<Vec<_>>().join("\n")
@@ -231,11 +317,10 @@ fn read_log(state: tauri::State<'_, Backend>, lines: Option<usize>) -> String {
 /// 打开配置文件夹（Finder / 资源管理器）。
 #[tauri::command]
 fn open_data_dir(state: tauri::State<'_, Backend>) -> Result<(), String> {
-    let probe = run_backend(&state, &["config", "--json"], None);
-    let dir = serde_json::from_str::<serde_json::Value>(&probe.stdout)
-        .ok()
-        .and_then(|v| v.get("data_dir").and_then(|d| d.as_str()).map(String::from))
-        .ok_or_else(|| "拿不到数据目录".to_string())?;
+    let dir = state.data_dir.to_string_lossy().to_string();
+    if dir.is_empty() {
+        return Err("拿不到数据目录".to_string());
+    }
     #[cfg(target_os = "macos")]
     {
         Command::new("open").arg(&dir).spawn().map_err(|e| e.to_string())?;
