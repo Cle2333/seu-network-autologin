@@ -1015,11 +1015,15 @@ def collect_status(cfg):
 CARRIERS = {"1": ("@cmcc", "中国移动"), "2": ("@dx", "中国电信"), "3": ("@lt", "中国联通")}
 
 
-def build_config(account, password, carrier_choice=""):
-    """按「一卡通 + 密码 + 运营商选择」生成一份完整配置。
+def build_config(account, password, carrier_choice="",
+                 wlan_account="", wlan_password=""):
+    """按「宿舍账号 + 教室账号 + 运营商选择」生成一份完整配置。
 
     carrier_choice 是 "1"/"2"/"3"（明确知道哪家），留空表示不确定——
     这时三家都写上，认证时依次尝试、失败的自助跳过。
+
+    宿舍和教室用同一个号时（大多数情况），wlan_account / wlan_password 留空，
+    教室那条会自动回退到顶层的 account / password；用不同的号就把它们传进来。
     命令行向导和图形界面的设置对话框共用这一份逻辑。
     """
     cfg = json.loads(json.dumps(DEFAULT_CONFIG))
@@ -1049,13 +1053,19 @@ def build_config(account, password, carrier_choice=""):
         } for offset, (suffix, carrier) in enumerate(
             (CARRIERS["1"], CARRIERS["2"], CARRIERS["3"]))]
 
+    # 教室用的是另一个号时，单独写在这个 profile 里（留空则回退到顶层的号）
+    if wlan_account.strip():
+        wlan_profile["account"] = wlan_account.strip()
+    if wlan_password.strip():
+        wlan_profile["password"] = wlan_password.strip()
+
     wlan_profile["priority"] = 50
     cfg["profiles"] = isp_profiles + [wlan_profile]
     return cfg
 
 
 def first_run_wizard(force=False):
-    """没配置时在终端里问三个问题，写出 config.json。
+    """没配置时在终端里问几个问题，写出 config.json。
 
     注意：只有能交互的终端才走这里。双击启动（没有终端）时由 GUI 的设置对话框接手。
     """
@@ -1063,22 +1073,32 @@ def first_run_wizard(force=False):
         return False
     print()
     print("=" * 60)
-    print(" 第一次运行，回答三个问题就能用了（回车 = 用方括号里的默认值）")
+    print(" 第一次运行，回答几个问题就能用了（回车 = 用方括号里的默认值）")
     print("=" * 60)
     try:
         account = ""
         while not account:
-            account = input(" 1/3 一卡通号：").strip()
-        password = input(" 2/3 密码（校园网和宽带是同一个）：").strip()
-        print(" 3/3 宿舍的运营商宽带（SEU-ISP）是哪一家？")
+            account = input(" 1/4 宿舍宽带（SEU-ISP）的账号：").strip()
+        password = input(" 2/4 宿舍宽带的密码：").strip()
+        print(" 3/4 宿舍的运营商宽带是哪一家？")
         print("      1 = 中国移动   2 = 中国电信   3 = 中国联通")
         print("      回车 = 不确定 / 都写上，让程序自己去试")
         choice = input("      [回车 = 不确定，三家都配上]：").strip()
+
+        # 教室（SEU-WLAN）是不是另一个号。宿舍和教室共用一个号的情况很常见，
+        # 所以默认回车就是「同一个号」，只有明确回答 y 才继续问。
+        print(" 4/4 教室的校园网（SEU-WLAN）用的是同一个号吗？")
+        print("      回车 = 是，同一个号；输入 y = 另一个号")
+        wlan_account = wlan_password = ""
+        if input("      [回车 = 同一个号]：").strip().lower() in ("y", "yes"):
+            while not wlan_account:
+                wlan_account = input("      教室的账号：").strip()
+            wlan_password = input("      教室的密码（直接回车 = 和宿舍一样）：").strip()
     except (EOFError, KeyboardInterrupt):
         print("\n 已取消。")
         return False
 
-    cfg = build_config(account, password, choice)
+    cfg = build_config(account, password, choice, wlan_account, wlan_password)
     try:
         save_config(cfg)
     except OSError as exc:
@@ -1088,6 +1108,8 @@ def first_run_wizard(force=False):
     print(" 共写了 %d 条账号写法（宿舍走运营商宽带、教室走校园网），"
           "程序会自己挑能用的那条。" % len(cfg["profiles"]))
     print(" 不确定运营商的话，用不上的那几条会自动跳过，不用管。")
+    if wlan_account:
+        print(" 教室用的是单独的号：%s" % wlan_account)
     print(" 接下来试一次认证，结果打印在下面。\n")
     return True
 
@@ -1213,32 +1235,102 @@ def run_gui():
             widget.pack(fill="x", padx=20, pady=(top, 2))
             return widget
 
-        def hint(text):
-            widget = tk.Label(dialog, text=text, bg=COLORS["bg"], fg=COLORS["dim"],
+        def hint(parent, text, wraplength=410):
+            widget = tk.Label(parent, text=text, bg=COLORS["bg"], fg=COLORS["dim"],
                               font=("PingFang SC", 10), anchor="w", justify="left",
-                              wraplength=410)
+                              wraplength=wraplength)
             widget.pack(fill="x", padx=20, pady=(0, 4))
             return widget
 
-        label("一卡通号", top=18)
+        label("宿舍宽带（SEU-ISP）的账号", top=18)
         account_entry = tk.Entry(dialog, bg="#16171a", fg=COLORS["text"],
                                  insertbackground=COLORS["text"], relief="flat",
                                  font=("PingFang SC", 13))
         account_entry.pack(fill="x", padx=20, ipady=6)
-        account_entry.insert(0, str(current.get("account") or ""))
 
-        label("密码（校园网和宽带是同一个）")
+        label("宿舍宽带的密码")
         password_entry = tk.Entry(dialog, bg="#16171a", fg=COLORS["text"],
                                   insertbackground=COLORS["text"], relief="flat",
                                   show="•", font=("PingFang SC", 13))
         password_entry.pack(fill="x", padx=20, ipady=6)
-        password_entry.insert(0, str(current.get("password") or ""))
 
-        label("宿舍宽带的运营商")
-        hint("不确定就直接用默认的「不确定」，程序会把三家都写上依次试，用不上的自动跳过。")
+        # 教室（SEU-WLAN）的号可能和宿舍不一样，默认折叠起来，勾上才填。
+        existing_wlan = {}
+        for profile in (current.get("profiles") or []):
+            if isinstance(profile, dict) and "SEU-WLAN" in (profile.get("ssids") or []):
+                existing_wlan = profile
+                break
 
-        carrier_var = tk.StringVar(value="")
-        choices = tk.Frame(dialog, bg=COLORS["bg"])
+        separate_var = tk.BooleanVar(
+            value=bool(str(existing_wlan.get("account") or "").strip()))
+        wlan_frame = tk.Frame(dialog, bg=COLORS["bg"])
+
+        def fit_dialog():
+            """按当前内容重新算尺寸并居中。
+
+            展开「教室另一个号」后内容会变高，不重算的话对话框会被裁掉一截，
+            底部的运营商选项和按钮就看不见了。
+            """
+            dialog.update_idletasks()
+            width = max(dialog.winfo_reqwidth(), 420)
+            height = dialog.winfo_reqheight()
+            x = root.winfo_rootx() + (root.winfo_width() - width) // 2
+            y = root.winfo_rooty() + max((root.winfo_height() - height) // 3, 20)
+            dialog.geometry("%dx%d+%d+%d" % (width, height, max(x, 0), max(y, 0)))
+
+        def toggle_wlan():
+            if separate_var.get():
+                wlan_frame.pack(fill="x", padx=0, before=carrier_block)
+            else:
+                wlan_frame.pack_forget()
+            # 内容高度变了，重新排版并调整窗口
+            dialog.update_idletasks()
+            fit_dialog()
+
+        tk.Checkbutton(
+            dialog, text="教室的校园网（SEU-WLAN）用另一个号",
+            variable=separate_var, command=toggle_wlan,
+            bg=COLORS["bg"], fg=COLORS["text"], selectcolor="#3a3d42",
+            activebackground=COLORS["bg"], activeforeground=COLORS["text"],
+            font=("PingFang SC", 11), highlightthickness=0, bd=0, anchor="w"
+        ).pack(fill="x", padx=18, pady=(10, 0))
+
+        wlan_account_entry = tk.Entry(wlan_frame, bg="#16171a", fg=COLORS["text"],
+                                      insertbackground=COLORS["text"], relief="flat",
+                                      font=("PingFang SC", 13))
+        wlan_account_entry.pack(fill="x", padx=20, ipady=6, pady=(4, 0))
+        wlan_password_entry = tk.Entry(wlan_frame, bg="#16171a", fg=COLORS["text"],
+                                       insertbackground=COLORS["text"], relief="flat",
+                                       show="•", font=("PingFang SC", 13))
+        wlan_password_entry.pack(fill="x", padx=20, ipady=6, pady=(4, 0))
+        tk.Label(wlan_frame, text="教室的账号 / 密码（密码留空 = 和宿舍一样）",
+                 bg=COLORS["bg"], fg=COLORS["dim"],
+                 font=("PingFang SC", 10), anchor="w").pack(fill="x", padx=20, pady=(2, 0))
+
+        carrier_block = tk.Frame(dialog, bg=COLORS["bg"])
+        carrier_block.pack(fill="x")
+        tk.Label(carrier_block, text="宿舍宽带的运营商", bg=COLORS["bg"], fg=COLORS["text"],
+                 font=("PingFang SC", 12), anchor="w").pack(fill="x", padx=20, pady=(12, 2))
+        hint(carrier_block, "不确定就直接用默认的「不确定」，程序会把三家都写上依次试。")
+
+        # 已有的运营商选择：从 SEU-ISP 那几条的后缀反推。
+        # 只有「恰好一条」时才能确定是哪家；如果有多条（说明当初选的是「不确定」，
+        # 三家都配上了），必须回退成「不确定」，否则用户只是打开设置点个保存，
+        # 就会因为预选成移动而把另外两条兜底配置静默删掉。
+        isp_suffixes = [
+            profile.get("account_suffix")
+            for profile in (current.get("profiles") or [])
+            if isinstance(profile, dict) and "SEU-ISP" in (profile.get("ssids") or [])
+        ]
+        current_carrier = ""
+        if len(isp_suffixes) == 1:
+            for key, (suffix, _name) in CARRIERS.items():
+                if isp_suffixes[0] == suffix:
+                    current_carrier = key
+                    break
+
+        carrier_var = tk.StringVar(value=current_carrier)
+        choices = tk.Frame(carrier_block, bg=COLORS["bg"])
         choices.pack(fill="x", padx=20, pady=(2, 0))
         for value, text in (("", "不确定"), ("1", "移动"), ("2", "电信"), ("3", "联通")):
             tk.Radiobutton(
@@ -1248,6 +1340,14 @@ def run_gui():
                 font=("PingFang SC", 12), highlightthickness=0, bd=0
             ).pack(side="left", padx=(0, 14))
 
+        # 预填已有值
+        account_entry.insert(0, str(current.get("account") or ""))
+        password_entry.insert(0, str(current.get("password") or ""))
+        wlan_account_entry.insert(0, str(existing_wlan.get("account") or ""))
+        wlan_password_entry.insert(0, str(existing_wlan.get("password") or ""))
+        if separate_var.get():
+            toggle_wlan()
+
         message = tk.Label(dialog, text="", bg=COLORS["bg"], fg=COLORS["bad"],
                            font=("PingFang SC", 11), anchor="w", wraplength=410)
         message.pack(fill="x", padx=20, pady=(10, 0))
@@ -1256,15 +1356,24 @@ def run_gui():
             account = account_entry.get().strip()
             password = password_entry.get().strip()
             if not account:
-                message.configure(text="一卡通号不能为空。")
+                message.configure(text="宿舍宽带的账号不能为空。")
                 account_entry.focus_set()
                 return
             if not password:
-                message.configure(text="密码不能为空。")
+                message.configure(text="宿舍宽带的密码不能为空。")
                 password_entry.focus_set()
                 return
+            wlan_account = wlan_password = ""
+            if separate_var.get():
+                wlan_account = wlan_account_entry.get().strip()
+                if not wlan_account:
+                    message.configure(text="勾了「教室用另一个号」，就要填教室的账号。")
+                    wlan_account_entry.focus_set()
+                    return
+                wlan_password = wlan_password_entry.get().strip()
             try:
-                save_config(build_config(account, password, carrier_var.get()))
+                save_config(build_config(account, password, carrier_var.get(),
+                                         wlan_account, wlan_password))
             except OSError as exc:
                 message.configure(text="保存失败：%s" % exc)
                 return
@@ -1276,8 +1385,8 @@ def run_gui():
         def on_return(_event):
             do_save()
 
-        account_entry.bind("<Return>", on_return)
-        password_entry.bind("<Return>", on_return)
+        for entry in (account_entry, password_entry, wlan_account_entry, wlan_password_entry):
+            entry.bind("<Return>", on_return)
 
         row = tk.Frame(dialog, bg=COLORS["bg"])
         row.pack(fill="x", padx=20, pady=(14, 0))
@@ -1287,14 +1396,8 @@ def run_gui():
         cancel_btn.pack(side="right", padx=(0, 10))
 
         dialog.grab_set()
-        # 让对话框按内容自适应高度，并居中显示在主窗口上（不写死 460x400，
-        # 否则内容放不下时会露出主界面，看着像窗口坏了）
-        dialog.update_idletasks()
-        width = dialog.winfo_reqwidth()
-        height = dialog.winfo_reqheight()
-        x = root.winfo_rootx() + (root.winfo_width() - width) // 2
-        y = root.winfo_rooty() + (root.winfo_height() - height) // 3
-        dialog.geometry("%dx%d+%d+%d" % (width, height, max(x, 0), max(y, 0)))
+        # 按内容自适应尺寸并居中（不写死 460x400，否则内容放不下时会露出来挡住主界面）
+        fit_dialog()
         account_entry.focus_set()
         return dialog
 

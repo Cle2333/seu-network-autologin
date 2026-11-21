@@ -118,11 +118,11 @@ macOS / Windows 通用 · 按网络环境自动挑选账号写法
 
 ```jsonc
 {
-  "account": "一卡通号",
-  "password": "密码",
+  "account": "宿舍宽带的账号",
+  "password": "宿舍宽带的密码",
   "profiles": [
-    {"name": "宿舍走宽带", "ssids": ["SEU-ISP"],  "account_suffix": "@cmcc", "priority": 10},
-    {"name": "教室走校园网", "ssids": ["SEU-WLAN"], "account_prefix": ",0,", "account_suffix": "", "priority": 20}
+    {"name": "宿舍走宽带",   "ssids": ["SEU-ISP"],  "account_suffix": "@cmcc", "priority": 10},
+    {"name": "教室走校园网", "ssids": ["SEU-WLAN"], "account_prefix": ",0,", "account_suffix": "", "priority": 50}
   ]
 }
 ```
@@ -136,6 +136,34 @@ macOS / Windows 通用 · 按网络环境自动挑选账号写法
 每一条都会真的提交一次，外网通了才认。**写错的后缀会被自动跳过，不会卡住认证。**
 
 > 所以就算你拿不准自己的账号该不该带 `@cmcc`，把两种都写上即可，程序自己会筛。
+
+### 宿舍和教室用的不是同一个号
+
+那就把教室那个号单独写进它自己的 profile，留空的项才会回退到顶层：
+
+```jsonc
+{
+  "account": "宿舍的号",      // 顶层 = 宿舍宽带用
+  "password": "宿舍的密码",
+  "profiles": [
+    {"name": "宿舍走宽带",   "ssids": ["SEU-ISP"],  "account_suffix": "@cmcc", "priority": 10},
+    {
+      "name": "教室走校园网",
+      "ssids": ["SEU-WLAN"],
+      "account_prefix": ",0,",
+      "account_suffix": "",
+      "account": "教室的号",   // ← 单独写在这里
+      "password": "教室的密码", // ← 密码也一样，留空则和宿舍共用
+      "priority": 50
+    }
+  ]
+}
+```
+
+界面上更省事：打开「设置账号」，勾上**「教室的校园网（SEU-WLAN）用另一个号」**，
+额度会展开出教室的账号和密码两格。
+
+`init` 向导第 4 问也会问到这一点，直接回车表示同一个号。
 
 ## macOS 上读不到 WiFi 名（正常现象）
 
