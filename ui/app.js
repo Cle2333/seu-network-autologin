@@ -330,14 +330,16 @@ el.ckAutoReconnect.addEventListener('change', () => {
 // 窗口收起（隐藏）时也继续跑——掉线时人很可能正关着窗口。
 
 let pollTimer = null;
+let reconnecting = false;   // 防止两轮轮询同时触发重连
 
 async function pollOnce() {
-  if (busy) return;
+  if (busy || reconnecting) return;
   busy = true;
   let s = null;
   try {
     s = await invoke('get_status');
     applyStatus(s);
+    syncSceneButtons(s.active_scene);
   } catch {
     /* 单次失败不改界面 */
   } finally {
@@ -352,29 +354,34 @@ async function pollOnce() {
 
 // 掉线恢复：先试当前场景，不行再试另一个（换地方时靠这个自动切过去）
 async function autoReconnectNow(s) {
-  if (busy) return;
-  const ordered = sceneList.length
-    ? [...sceneList].sort((a, b) =>
-        (b.key === s.active_scene) - (a.key === s.active_scene))
-    : [];
+  if (reconnecting) return;
+  reconnecting = true;
+  try {
+    const ordered = sceneList.length
+      ? [...sceneList].sort((a, b) =>
+          (b.key === s.active_scene) - (a.key === s.active_scene))
+      : [];
 
-  for (const scene of ordered) {
-    setBusy(true);
-    setStatus('busy', '掉线了，正在重连', `尝试${scene.label}…`);
-    try {
-      const r = await invoke('switch_scene', { key: scene.key, connectWifi: true });
-      if (r.ok) {
-        setStatus('ok', '已自动重连', `${scene.label}（${scene.wifi}）`);
-        await loadScenes();
-        return;
+    for (const scene of ordered) {
+      setBusy(true);
+      setStatus('busy', '掉线了，正在重连', `尝试${scene.label}…`);
+      try {
+        const r = await invoke('switch_scene', { key: scene.key, connectWifi: true });
+        if (r.ok) {
+          setStatus('ok', '已自动重连', `${scene.label}（${scene.wifi}）`);
+          syncSceneButtons(scene.key);
+          return;
+        }
+      } catch {
+        /* 试下一个 */
+      } finally {
+        setBusy(false);
       }
-    } catch {
-      /* 试下一个 */
-    } finally {
-      setBusy(false);
     }
+    setStatus('bad', '重连失败', '两个场景都没连上，稍后再试');
+  } finally {
+    reconnecting = false;
   }
-  setStatus('bad', '重连失败', '两个场景都没连上，稍后再试');
 }
 
 function startPolling(interval) {
