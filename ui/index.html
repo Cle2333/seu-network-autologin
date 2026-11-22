@@ -21,13 +21,16 @@
     </div>
 
     <div class="meta" id="meta">
-      <div class="meta-row"><span>网络</span><b id="mNetwork">—</b></div>
+      <div class="meta-row"><span>场景</span><b id="mScene">—</b></div>
       <div class="meta-row"><span>本机</span><b id="mIp">—</b></div>
       <div class="meta-row"><span>账号</span><b id="mAccount">—</b></div>
     </div>
   </section>
 
-  <!-- 主操作 -->
+  <!-- 场景切换：这是主操作 -->
+  <div class="scenes" id="sceneButtons"></div>
+
+  <!-- 次操作 -->
   <div class="actions">
     <button class="primary" id="btnLogin">
       <span class="spinner"></span><span class="label">立即认证</span>
@@ -47,49 +50,62 @@
     <button class="link" id="btnOpenDir">在访达中打开</button>
   </section>
 
-  <!-- 设置 -->
+  <!-- 设置：两个场景各自一套 -->
   <section class="panel hidden" id="viewSettings">
     <label class="check">
-      <input id="ckAutostart" type="checkbox">
-      <span>开机自动启动（登录后自动打开）</span>
+      <input id="ckAutoReconnect" type="checkbox" checked>
+      <span>掉线自动重连</span>
     </label>
-    <p class="hint" id="autostartHint">菜单栏图标在 = 在运行，图标消失 = 真的停了。</p>
+    <p class="hint">检测到掉线会自动认证，换地方连不上会自动试另一个场景。想彻底离线就退出程序。</p>
+
+    <label class="check">
+      <input id="ckAutostart" type="checkbox">
+      <span>开机自动启动</span>
+    </label>
+    <p class="hint" id="autostartHint">登录后自动打开并认证一次。</p>
 
     <div class="divider"></div>
 
-    <label class="field">
-      <span>宿舍宽带账号</span>
-      <input id="inAccount" type="text" placeholder="一卡通号" autocomplete="off" spellcheck="false">
-    </label>
-    <label class="field">
-      <span>宿舍宽带密码</span>
-      <input id="inPassword" type="password" placeholder="留空 = 不修改" autocomplete="off">
-    </label>
-
-    <div class="field">
-      <span>运营商</span>
-      <div class="segmented" id="carrierGroup">
-        <button data-v="" class="on">不确定</button>
-        <button data-v="1">移动</button>
-        <button data-v="2">电信</button>
-        <button data-v="3">联通</button>
+    <!-- 场景 1 -->
+    <div class="scene-editor" data-index="0">
+      <div class="scene-head">
+        <b class="scene-label">宿舍</b>
+        <span class="scene-wifi">SEU-ISP</span>
+      </div>
+      <label class="field">
+        <span>账号</span>
+        <input class="in-account" type="text" placeholder="一卡通号" autocomplete="off" spellcheck="false">
+      </label>
+      <label class="field">
+        <span>密码</span>
+        <input class="in-password" type="password" placeholder="留空 = 不修改" autocomplete="off">
+      </label>
+      <div class="field">
+        <span>运营商</span>
+        <div class="segmented in-carrier">
+          <button data-v="" class="on">不确定</button>
+          <button data-v="1">移动</button>
+          <button data-v="2">电信</button>
+          <button data-v="3">联通</button>
+        </div>
       </div>
     </div>
 
-    <label class="check">
-      <input id="ckWlan" type="checkbox">
-      <span>教室用另一个号</span>
-    </label>
-
-    <div class="sub-fields hidden" id="wlanFields">
+    <!-- 场景 2 -->
+    <div class="scene-editor" data-index="1">
+      <div class="scene-head">
+        <b class="scene-label">教室</b>
+        <span class="scene-wifi">SEU-WLAN</span>
+      </div>
       <label class="field">
-        <span>教室账号</span>
-        <input id="inWlanAccount" type="text" placeholder="教室登的号" autocomplete="off" spellcheck="false">
+        <span>账号</span>
+        <input class="in-account" type="text" placeholder="教室登的号" autocomplete="off" spellcheck="false">
       </label>
       <label class="field">
-        <span>教室密码</span>
-        <input id="inWlanPassword" type="password" placeholder="留空 = 同宿舍" autocomplete="off">
+        <span>密码</span>
+        <input class="in-password" type="password" placeholder="留空 = 和宿舍一样" autocomplete="off">
       </label>
+      <p class="hint">校园网账号通常带 <code>,0,</code> 前缀，不用自己写。</p>
     </div>
 
     <button class="primary small" id="btnSave">保存</button>

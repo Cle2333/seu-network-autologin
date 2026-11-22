@@ -726,21 +726,152 @@ def wifi_offline_hint():
     return "检查 Windows 是否已连上 SEU-WLAN / SEU-ISP"
 
 
-def join_wifi(ssid, cfg):
-    """主动连指定无线网络（校园网都是开放网络，不需要密码）。"""
+def run_wifi_connect(cfg, ssid, wait_seconds=20):
+    """连指定 Wi-Fi，并**等网络真的恢复**再返回。
+
+    坑：切换 Wi-Fi 的那几秒网络是断的，此时探测门户必然全失败。
+    之前直接 sleep(3) 就去探测，结果每次都报「连不上校园 Wi-Fi」，
+    根本没走到认证——用户看到的就是「程序没自己认证，还弹出登录页让我手填」。
+
+    所以这里等到「本机拿到 IP 且门户可达」为止，最多等 wait_seconds 秒。
+    """
     if not ssid:
         return False
+
     if IS_MAC:
         device = cfg.get("wifi_interface") or wifi_device()
-        out = run(["networksetup", "-setairportnetwork", device, ssid], timeout=25)
-        ok = ("could not find" not in out.lower()) and ("error" not in out.lower())
-        return ok
-    device = cfg.get("wifi_interface") or ""
-    cmd = ["netsh", "wlan", "connect", "name=%s" % ssid]
-    if device:
-        cmd.append("interface=%s" % device)
-    out = run(cmd, timeout=25, encoding="gbk")
-    return "completed" in out.lower() or "成功" in out
+        run(["networksetup", "-setairportnetwork", device, ssid], timeout=25)
+    else:
+        device = cfg.get("wifi_interface") or ""
+        cmd = ["netsh", "wlan", "connect", "name=%s" % ssid]
+        if device:
+            cmd.append("interface=%s" % device)
+        run(cmd, timeout=25, encoding="gbk")
+
+    # 轮询等网络恢复：先有 IP，再能访问门户
+    deadline = time.time() + wait_seconds
+    while time.time() < deadline:
+        time.sleep(2)
+        if not primary_ip():
+            continue
+        if _portal_reachable(cfg):
+            return True
+    # 等不到也不代表失败——有些网络拿到 IP 但要认证后才能访问门户，
+    # 交给调用方的认证流程判断
+    return bool(primary_ip())
+
+
+def join_wifi(ssid, cfg):
+    """主动连指定无线网络，并**确认真的连上了**。
+
+    坑：networksetup -setairportnetwork 无论成功失败都返回 0、通常没有输出；
+    而且连不上时会留在原来那个 Wi-Fi 上，原网络照样能访问门户——
+    只用「门户可达」判断会把失败当成成功（实测过，会谎报「已连上教室」）。
+
+    所以这里先记录切换前的网络指纹，切换后要求指纹发生变化，
+    再加上门户可达，两个条件都满足才算成功。
+    """
+    if not ssid:
+        return False
+
+    before = _wifi_fingerprint(cfg)
+
+    if IS_MAC:
+        device = cfg.get("wifi_interface") or wifi_device()
+        run(["networksetup", "-setairportnetwork", device, ssid], timeout=25)
+    else:
+        device = cfg.get("wifi_interface") or ""
+        cmd = ["netsh", "wlan", "connect", "name=%s" % ssid]
+        if device:
+            cmd.append("interface=%s" % device)
+        run(cmd, timeout=25, encoding="gbk")
+
+    # 关联需要几秒，最多等 15 秒
+    deadline = time.time() + 15
+    portal_ok_since = None
+    while time.time() < deadline:
+        time.sleep(2)
+        after = _wifi_fingerprint(cfg)
+        changed = after and after != before
+        if _portal_reachable(cfg):
+            # 门户通了，还要确认网络真的换了（防止「留在原网络」被误判）
+            if changed:
+                return True
+            if portal_ok_since is None:
+                portal_ok_since = time.time()
+            # 网络指纹拿不到时（macOS 读不到 SSID）只能靠 BSSID 变化判断
+            elif time.time() - portal_ok_since > 6:
+                return _bssid_changed(before, after) or not before
+    return False
+
+
+def scene_from_online_account(cfg, uid):
+    """用门户回显的在线账号反推当前在用哪个场景。
+
+    macOS 读不到 SSID / BSSID（未授权定位时全是 <redacted>），
+    但门户会告诉我们「这个 IP 上现在是哪个账号在线」——比 SSID 更准。
+    返回场景 key，对不上返回空串。
+    """
+    uid = str(uid or "").strip()
+    if not uid:
+        return ""
+    # 门户回显的 uid 可能带后缀（213253274@unicom）、可能带前缀（,0,213252649）
+    bare_uid = uid.split("@")[0]
+    for profile in cfg.get("profiles") or []:
+        if not isinstance(profile, dict):
+            continue
+        key = profile.get("key")
+        if not key:
+            continue
+        account = str(profile.get("account") or cfg.get("account") or "").strip()
+        if not account:
+            continue
+        if account == bare_uid or account in uid:
+            return key
+    return ""
+
+
+def resolve_current_scene(cfg):
+    """当前在用的场景：优先用门户回显的账号反推，其次用手动/记忆的。"""
+    timeout = float(cfg.get("request_timeout_seconds", 4))
+    portal, _info = find_portal(make_opener(), cfg, timeout)
+    if portal:
+        online, _detail, uid = query_online(portal, cfg, timeout)
+        if online:
+            matched = scene_from_online_account(cfg, uid)
+            if matched:
+                _remember_scene(matched)
+                return matched
+    return active_scene(cfg)
+
+
+def _wifi_fingerprint(cfg):
+    """当前 Wi-Fi 的指纹（BSSID 优先，拿不到 SSID 时的替代）。"""
+    device = cfg.get("wifi_interface") or wifi_device()
+    out = run(["ipconfig", "getsummary", device])
+    match = re.search(r"^\s*BSSID\s*:\s*(.+?)\s*$", out, re.M)
+    if not match:
+        return ""
+    value = match.group(1).strip()
+    return "" if value == "<redacted>" else value
+
+
+def _bssid_changed(before, after):
+    return bool(before) and bool(after) and before != after
+
+
+def _portal_reachable(cfg):
+    """能不能访问到校园网认证门户（说明已关联到校园 Wi-Fi）。"""
+    opener = make_opener()
+    timeout = min(3.0, float(cfg.get("request_timeout_seconds", 4)))
+    for url in cfg.get("portal_urls") or DEFAULT_CONFIG["portal_urls"]:
+        try:
+            status, raw = http_request(opener, url, timeout=timeout)
+        except Exception:
+            continue
+        if status and any(m in decode_body(raw).lower() for m in PORTAL_MARKERS):
+            return True
+    return False
 
 
 # ============================================================================
@@ -877,6 +1008,10 @@ AUTH_FAIL_KEYS = (
 ALREADY_ONLINE_KEYS = (
     "终端ip已在线", "已在线", "已经在线", "ip已在线",
     "you are already online", "already online",
+    # Drcom 在「账号已有会话 / 在线数超限」时回这个，不是密码错
+    "welcome to drcom system",
+    "在线数已达最大允许登录数",
+    "已达到最大允许登录数",
 )
 
 
@@ -1091,21 +1226,44 @@ def forget_profile(fingerprint):
 # ============================================================================
 
 def try_login_once(cfg, log, portal, profile, index, timeout, login_timeout):
-    """用一份配置提交一次认证，并以外网是否真的通为最终判据。"""
+    """用一份配置提交一次认证，并以外网是否真的通为最终判据。
+
+    后缀被拒时会自动试别名后缀（比如配置写 @lt、门户其实认 @unicom）。
+    Drcom 各校/各期版本认的后缀不一样，写死一个很容易下次就失效。
+    """
     creds = _profile_credentials(profile, cfg)
     if not creds["password"]:
         log("    %s：没有密码，跳过" % _profile_label(profile, index))
         return "skip", ""
     label = _profile_label(profile, index)
-    url = build_login_url(portal, cfg, creds)
-    try:
-        _status, raw = http_request(make_opener(), url, timeout=login_timeout)
-        text = decode_body(raw)
-        state, detail = classify_login(text)
-    except Exception as exc:
-        state, detail = "unknown", "%s: %s" % (exc.__class__.__name__, exc)
 
-    log("  提交认证（%s｜账号 %s）→ %s" % (label, creds["login_name"], detail))
+    # 要试的账号写法：原样 + 别名后缀
+    suffix = str(profile.get("account_suffix") or cfg.get("account_suffix") or "")
+    login_names = [creds["login_name"]]
+    for alias in SUFFIX_ALIASES.get(suffix, ()):
+        candidate = creds["login_name"]
+        if suffix and candidate.endswith(suffix):
+            candidate = candidate[: -len(suffix)] + alias
+        else:
+            candidate = creds["login_name"] + alias
+        login_names.append(candidate)
+
+    state, detail = "unknown", ""
+    for name in login_names:
+        attempt = dict(creds, login_name=name)
+        url = build_login_url(portal, cfg, attempt)
+        try:
+            _status, raw = http_request(make_opener(), url, timeout=login_timeout)
+            state, detail = classify_login(decode_body(raw))
+        except Exception as exc:
+            state, detail = "unknown", "%s: %s" % (exc.__class__.__name__, exc)
+
+        log("  提交认证（%s｜账号 %s）→ %s" % (label, name, detail))
+        if state != "authfail":
+            break
+        if name != login_names[-1]:
+            log("    这个后缀被拒，换别名后缀再试")
+
     if state == "authfail":
         return "authfail", detail
     if state == "online":
@@ -1199,11 +1357,7 @@ def switch_scene(cfg, log, key, connect_wifi=True):
 
     if connect_wifi and wifi:
         log("切换到 %s：连接 Wi-Fi %s" % (label, wifi))
-        if not join_wifi(str(wifi), cfg):
-            return {"ok": False, "code": -1, "scene": key,
-                    "message": "连不上 Wi-Fi %s（可能不在范围内）" % wifi}
-        # 系统关联需要一点时间才生效
-        time.sleep(2)
+        run_wifi_connect(cfg, str(wifi))
 
     # 只提交这一个场景的账号，不参与「依次试」，避免切到教室却用了宿舍的号
     instance = InstanceLock()
@@ -1224,21 +1378,39 @@ def switch_scene(cfg, log, key, connect_wifi=True):
 
 
 def _authenticate_scene_only(cfg, log, profile):
-    """只用指定 profile 认证，不尝试其它配置。"""
+    """只用指定 profile 认证，不尝试其它配置。
+
+    返回 0 表示「这个场景真的生效了」——不只是「网络通」，
+    还要确认门户回显的账号就是这个场景的号。
+    否则在教室点「宿舍」时，因为原网络本来就通，会被误判成切换成功。
+    """
     timeout = float(cfg.get("request_timeout_seconds", 4))
     login_timeout = float(cfg.get("login_timeout_seconds", 12))
-
-    reachable, _detail = connectivity_ok(cfg, timeout)
-    if reachable:
-        log("外网已通，不需要认证")
-        return 0
+    expected = str(profile.get("account") or cfg.get("account") or "").strip()
 
     portal, info = find_portal(make_opener(), cfg, timeout)
     if not portal:
-        log("未发现校园网门户（%s）" % info)
+        log("未发现校园网门户（%s）：连不上校园 Wi-Fi" % info)
         return 1
 
-    online, _detail, _uid = query_online(portal, cfg, timeout)
+    reachable, _detail = connectivity_ok(cfg, timeout)
+    online, _detail2, uid = query_online(portal, cfg, timeout)
+
+    if reachable:
+        # 网络本来就通。必须确认在线账号就是这个场景的，否则说明切错网络了。
+        bare_uid = str(uid or "").split("@")[0]
+        if expected and bare_uid == expected:
+            log("外网已通，且当前在线账号就是本场景（%s），无需重新认证" % bare_uid)
+            return 0
+        if not uid:
+            log("外网已通，但读不到在线账号，无法确认切换成功")
+            return 0
+        log("外网已通但在线的是 %s，不是本场景的 %s —— 先注销再认证"
+            % (bare_uid or uid, expected))
+        do_logout(portal, cfg, log)
+        time.sleep(2)
+        online = False
+
     if online:
         log("门户显示在线但外网不通，先注销再重新认证")
         do_logout(portal, cfg, log)
@@ -1248,6 +1420,12 @@ def _authenticate_scene_only(cfg, log, profile):
     state, _detail = try_login_once(
         cfg, log, portal, profile, index, timeout, login_timeout)
     if state == "ok":
+        # 认证后再核对一次，确认门户认的就是这个号
+        _ok, _d, new_uid = query_online(portal, cfg, timeout)
+        bare_new = str(new_uid or "").split("@")[0]
+        if expected and bare_new and bare_new != expected:
+            log("认证后门户显示的账号是 %s，不是 %s" % (bare_new, expected))
+            return 1
         return 0
     if state == "authfail":
         return 2
@@ -1423,12 +1601,19 @@ def collect_status(cfg):
         "connectivity_detail": "",
         "credentials": has_credentials(cfg),
         "config_error": cfg.get("_config_error", ""),
+        "active_scene": active_scene(cfg),
     }
     portal, detail = find_portal(make_opener(), cfg, timeout)
     if portal:
         info["portal"] = portal["base"]
         online, online_detail, uid = query_online(portal, cfg, timeout)
         info["online"], info["online_detail"], info["uid"] = online, online_detail, uid
+        # 用门户回显的账号反推当前场景，比读 SSID 可靠（macOS 读不到 SSID）
+        if online and uid:
+            matched = scene_from_online_account(cfg, uid)
+            if matched:
+                info["active_scene"] = matched
+                _remember_scene(matched)
     else:
         info["online_detail"] = detail
     ok, conn_detail = connectivity_ok(cfg, timeout)
@@ -1440,7 +1625,21 @@ def collect_status(cfg):
 # 首次配置向导
 # ============================================================================
 
-CARRIERS = {"1": ("@cmcc", "中国移动"), "2": ("@dx", "中国电信"), "3": ("@lt", "中国联通")}
+# 运营商后缀。注意：不同 Drcom 门户认的后缀不一样，实测东南这家认 @unicom，
+# 而 @lt 会返回 Authentication fail。所以配置里用 @unicom；
+# 老配置里写了 @lt 的，认证时会自动再试一次 @unicom（见 SUFFIX_ALIASES）。
+CARRIERS = {
+    "1": ("@cmcc", "中国移动"),
+    "2": ("@dx", "中国电信"),
+    "3": ("@unicom", "中国联通"),
+}
+
+# 后缀别名：配置里写了左边的，认证时额外试右边的。
+# 2026-11 实测：联通号用 @lt 报 Authentication fail，用 @unicom 才认（返回已在线）。
+SUFFIX_ALIASES = {
+    "@lt": ("@unicom",),
+    "@unicom": ("@lt",),
+}
 
 
 def build_config(account, password, carrier_choice="",
@@ -2336,6 +2535,24 @@ def _switch_command(cfg, key, connect_wifi):
     return 0 if result.get("ok") else 1
 
 
+def _carrier_choice(cfg):
+    """从宿舍场景的后缀反推运营商选择（"1"/"2"/"3"，不确定返回空）。
+
+    只有恰好一条 SEU-ISP 配置时才反推；多条说明当初选的是「不确定」。
+    """
+    suffixes = [
+        p.get("account_suffix")
+        for p in (cfg.get("profiles") or [])
+        if isinstance(p, dict) and "SEU-ISP" in (p.get("ssids") or [])
+    ]
+    if len(suffixes) != 1:
+        return ""
+    for key, (suffix, _name) in CARRIERS.items():
+        if suffixes[0] == suffix:
+            return key
+    return ""
+
+
 def _config_command(cfg, flags):
     """输出界面能用的配置视图（不泄露密码明文）。"""
     stations = []
@@ -2354,7 +2571,9 @@ def _config_command(cfg, flags):
     view = {
         "account": str(cfg.get("account") or ""),
         "has_password": bool(str(cfg.get("password") or "").strip()),
+        "carrier": _carrier_choice(cfg),
         "stations": stations,
+        "scenes": scenes(cfg),
         "config_path": CONFIG_PATH,
         "data_dir": BASE_DIR,
         "config_error": cfg.get("_config_error", ""),

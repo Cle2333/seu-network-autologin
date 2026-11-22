@@ -351,3 +351,84 @@ input::placeholder { color: var(--dim); opacity: .65; }
   background: var(--line);
   margin: 6px 0 2px;
 }
+
+/* ---------- 场景切换按钮 ---------- */
+.scenes {
+  display: flex;
+  gap: 8px;
+}
+
+.scene-btn {
+  flex: 1;
+  padding: 9px 8px;
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  color: var(--dim);
+  text-align: left;
+  transition: border-color .15s, background .15s, color .15s;
+}
+.scene-btn:hover:not(:disabled) {
+  border-color: var(--dim);
+  color: var(--text);
+}
+.scene-btn .s-label {
+  display: block;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: inherit;
+}
+.scene-btn .s-wifi {
+  display: block;
+  font-size: 10px;
+  opacity: .7;
+  margin-top: 1px;
+  font-family: ui-monospace, Menlo, monospace;
+}
+/* 当前场景：高亮描边，表示「现在用的是这个」 */
+.scene-btn.current {
+  background: var(--card-hi);
+  border-color: var(--accent);
+  color: var(--text);
+}
+.scene-btn.current .s-wifi { opacity: .9; }
+.scene-btn:disabled { opacity: .55; }
+
+/* ---------- 设置里的场景编辑块 ---------- */
+.scene-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  padding: 11px;
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+.scene-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+}
+.scene-head .scene-label {
+  font-size: 12.5px;
+  color: var(--text);
+}
+.scene-head .scene-wifi {
+  font-size: 10px;
+  color: var(--dim);
+  font-family: ui-monospace, Menlo, monospace;
+}
+.scene-editor .field > span { font-size: 11px; }
+.scene-editor input[type="text"],
+.scene-editor input[type="password"] {
+  background: var(--bg);
+  height: 31px;
+  font-size: 12px;
+}
+.hint code {
+  font-family: ui-monospace, Menlo, monospace;
+  background: var(--card-hi);
+  padding: 1px 4px;
+  border-radius: 3px;
+  font-size: 10.5px;
+}

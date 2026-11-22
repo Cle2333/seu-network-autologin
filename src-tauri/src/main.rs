@@ -276,6 +276,40 @@ async fn get_config(state: tauri::State<'_, Backend>) -> Result<serde_json::Valu
     .await
 }
 
+/// 场景列表 + 当前场景，界面按这个渲染「宿舍 / 教室」切换按钮。
+#[tauri::command]
+async fn get_scenes(state: tauri::State<'_, Backend>) -> Result<serde_json::Value, String> {
+    blocking(&state, |backend| {
+        require_ready(&backend)?;
+        let out = run_backend(&backend, &["scenes", "--json"], None);
+        serde_json::from_str(&out.stdout)
+            .map_err(|e| format!("场景解析失败：{}｜{}", e, out.stderr.trim()))
+    })
+    .await
+}
+
+/// 一键切换场景：连对应 Wi-Fi 并用对应账号认证。
+#[tauri::command]
+async fn switch_scene(
+    state: tauri::State<'_, Backend>,
+    key: String,
+    connect_wifi: Option<bool>,
+) -> Result<serde_json::Value, String> {
+    let args: Vec<String> = if connect_wifi.unwrap_or(true) {
+        vec!["switch".into(), key]
+    } else {
+        vec!["switch".into(), key, "--no-wifi".into()]
+    };
+    blocking(&state, move |backend| {
+        require_ready(&backend)?;
+        let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        let out = run_backend(&backend, &refs, None);
+        serde_json::from_str(&out.stdout)
+            .map_err(|_| format!("切换失败：{}{}", out.stdout.trim(), out.stderr.trim()))
+    })
+    .await
+}
+
 /// 保存配置。密码留空表示沿用原来的。
 #[tauri::command]
 async fn save_config(
@@ -654,6 +688,8 @@ fn main() {
             backend_path,
             get_status,
             get_config,
+            get_scenes,
+            switch_scene,
             save_config,
             login_once,
             logout,
