@@ -49,6 +49,7 @@ function applyStatus(s) {
     setStatus('', '不在校园网', '连不上认证门户，可能在别的网络');
   }
 
+  // 场景显示以 status 的 active_scene 为准（它按门户在线账号反推，最准）
   const cur = sceneList.find((x) => x.key === s.active_scene) ||
               sceneList.find((x) => x.is_current);
   el.scene.textContent = cur
@@ -67,12 +68,23 @@ async function refresh() {
   try {
     const s = await invoke('get_status');
     applyStatus(s);
+    // 按钮高亮必须跟状态卡用同一个来源，否则会出现
+    // 「状态卡写着宿舍、按钮却高亮教室」这种自相矛盾
+    syncSceneButtons(s.active_scene);
   } catch (err) {
     setStatus('bad', '检查失败', String(err).slice(0, 60));
   } finally {
     busy = false;
   }
   loadLog();
+}
+
+// 只切换高亮，不重建 DOM（重建会打断点击动画、也会丢焦点）
+function syncSceneButtons(activeKey) {
+  if (!activeKey) return;
+  document.querySelectorAll('.scene-btn').forEach((btn) => {
+    btn.classList.toggle('current', btn.dataset.key === activeKey);
+  });
 }
 
 // ---------------------------------------------------------------- 场景切换
@@ -93,6 +105,7 @@ function renderSceneButtons(active) {
   el.sceneButtons.innerHTML = '';
   sceneList.forEach((scene) => {
     const btn = document.createElement('button');
+    btn.dataset.key = scene.key;          // 供 syncSceneButtons 定位
     btn.className = 'scene-btn' + (scene.key === active ? ' current' : '');
     btn.innerHTML =
       `<span class="s-label">${escapeHtml(scene.label)}</span>` +
@@ -115,7 +128,9 @@ async function switchTo(key) {
     const result = await invoke('switch_scene', { key, connectWifi: true });
     if (result.ok) {
       setStatus('ok', `已连上${scene.label}`, scene.wifi);
-      await loadScenes();
+      // 立刻把高亮切过去，不等后端：用户刚点的就是这个，视觉上必须马上响应
+      syncSceneButtons(key);
+      el.scene.textContent = `${scene.label}（${scene.wifi}）`;
     } else {
       setStatus('bad', `${scene.label}没连上`, result.message || '');
     }
