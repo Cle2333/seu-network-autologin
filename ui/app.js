@@ -312,6 +312,24 @@ refresh();
 loadConfig();
 loadAutostart();
 
+// 由开机自启拉起时（plist / 注册表里带了 --autostart），自动认证一次。
+// 手动打开程序不会走到这里——那样会变成「一开就联网」，不符合预期。
+(async () => {
+  try {
+    if (!(await invoke('launched_by_autostart'))) return;
+    // 等第一次 refresh 跑完（它占着 busy），否则 doLogin 会被 if (busy) return 直接跳过
+    for (let i = 0; i < 20 && busy; i += 1) {
+      await new Promise((r) => setTimeout(r, 200));
+    }
+    const s = await invoke('get_status').catch(() => null);
+    if (s && s.connectivity) return;   // 已经能上网，不用再提交
+    if (s && !s.credentials) return;   // 没配账号，认证也没意义
+    await doLogin();
+  } catch {
+    /* 自启认证失败不该影响正常使用 */
+  }
+})();
+
 // 定时刷新。窗口被隐藏（点关闭只是收起，托盘还在）时就别轮询了——
 // 每次刷新都要起 Python 进程，看不见的时候纯属浪费。
 let pollTimer = setInterval(refresh, 30000);

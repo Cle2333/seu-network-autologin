@@ -528,6 +528,7 @@ fn enable_autostart() -> Result<(), String> {
   <key>ProgramArguments</key>
   <array>
     <string>{exe}</string>
+    <string>--autostart</string>
   </array>
   <key>RunAtLoad</key><true/>
   <key>ProcessType</key><string>Interactive</string>
@@ -584,7 +585,7 @@ fn enable_autostart() -> Result<(), String> {
         "/t",
         "REG_SZ",
         "/d",
-        &format!("\"{}\"", exe.display()),
+        &format!("\"{}\" --autostart", exe.display()),
         "/f",
     ]))
     .map_err(|e| e.to_string())?;
@@ -622,7 +623,7 @@ fn enable_autostart() -> Result<(), String> {
         .replace('`', "\\`")
         .replace('$', "\\$");
     let content = format!(
-        "[Desktop Entry]\nType=Application\nName=东南大学校园网\nExec=\"{quoted}\"\nX-GNOME-Autostart-enabled=true\n"
+        "[Desktop Entry]\nType=Application\nName=东南大学校园网\nExec=\"{quoted}\" --autostart\nX-GNOME-Autostart-enabled=true\n"
     );
     std::fs::write(dir.join(format!("{AUTOSTART_LABEL}.desktop")), content)
         .map_err(|e| e.to_string())
@@ -640,6 +641,13 @@ fn disable_autostart() -> Result<(), String> {
     Ok(())
 }
 
+/// 这次启动是不是由开机自启拉起的（plist / 注册表里带了 --autostart）。
+/// 前端据此决定要不要自动认证一次。
+#[tauri::command]
+fn launched_by_autostart() -> bool {
+    std::env::args().any(|a| a == "--autostart")
+}
+
 fn main() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
@@ -653,6 +661,7 @@ fn main() {
             open_data_dir,
             autostart_state,
             set_autostart,
+            launched_by_autostart,
         ])
         .setup(|app| {
             let backend = locate_backend(app.handle());
