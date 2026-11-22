@@ -122,11 +122,16 @@ DEFAULT_CONFIG = {
     "account": "",
     "password": "",
 
-    # 按网络环境排的账号写法。实际提交的账号 = account_prefix + account + account_suffix
-    # 程序会挑「这个环境能用」的那份，所以多写几条也没关系，写错的那条会被自动跳过。
+    # 场景 = 一个地方的完整配置：连哪个 Wi-Fi、用哪个账号、走哪家运营商。
+    # 界面上开关就是按这里的 label 生成的，点一下就连 Wi-Fi + 认证。
+    # 实际提交的账号 = account_prefix + account + account_suffix。
+    # 程序按「上次成功的 → 场景匹配的 → priority」顺序试，写错的会自动跳过。
     "profiles": [
         {
-            "name": "运营商宽带（宿舍，优先）",
+            "key": "dorm",
+            "label": "宿舍",
+            "wifi": "SEU-ISP",
+            "name": "宿舍 · 运营商宽带",
             "ssids": ["SEU-ISP"],
             "account_prefix": "",
             "account_suffix": "@cmcc",
@@ -134,7 +139,10 @@ DEFAULT_CONFIG = {
             "note": "移动 @cmcc / 电信 @dx / 联通 @lt",
         },
         {
-            "name": "校园网（教室）",
+            "key": "classroom",
+            "label": "教室",
+            "wifi": "SEU-WLAN",
+            "name": "教室 · 校园网",
             "ssids": ["SEU-WLAN"],
             "account_prefix": ",0,",
             "account_suffix": "",
@@ -241,6 +249,24 @@ def load_config():
         cfg["_config_error"] = "没有 config.json（先跑 init 或 gui 里的设置）"
     except Exception as exc:
         cfg["_config_error"] = "%s: %s" % (exc.__class__.__name__, exc)
+
+    # 兼容旧配置：没有 key 的 profile 按顺序补 dorm / classroom
+    fallback_keys = ["dorm", "classroom", "hotspot"]
+    used = set()
+    for index, profile in enumerate(cfg.get("profiles") or []):
+        if not isinstance(profile, dict):
+            continue
+        if not profile.get("key"):
+            for candidate in fallback_keys:
+                if candidate not in used:
+                    profile["key"] = candidate
+                    profile.setdefault("label", {"dorm": "宿舍", "classroom": "教室"}.get(candidate, candidate))
+                    break
+        used.add(profile.get("key"))
+        if not profile.get("wifi"):
+            ssids = profile.get("ssids") or []
+            if ssids:
+                profile["wifi"] = ssids[0]
     return cfg
 
 
@@ -1093,6 +1119,139 @@ def try_login_once(cfg, log, portal, profile, index, timeout, login_timeout):
     if wait_connectivity(cfg, log, timeout):
         return "ok", detail
     return "neterr", detail
+
+
+def _scene_keys(cfg):
+    """配置里所有场景的 key，按声明顺序。"""
+    return [p.get("key") for p in (cfg.get("profiles") or [])
+            if isinstance(p, dict) and p.get("key")]
+
+
+def active_scene(cfg):
+    """当前该用哪个场景。优先用户手动选的，其次上次成功的，最后第一个。"""
+    keys = _scene_keys(cfg)
+    if not keys:
+        return ""
+    state = load_state()
+    manual = state.get("manual_scene")
+    if manual in keys:
+        return manual
+    last = state.get("last_scene")
+    if last in keys:
+        return last
+    return keys[0]
+
+
+def scenes(cfg):
+    """把 profiles 里带 key 的条目当成「场景」，给界面用。"""
+    current = active_scene(cfg)
+    out = []
+    for profile in cfg.get("profiles") or []:
+        if not isinstance(profile, dict):
+            continue
+        key = profile.get("key")
+        if not key:
+            continue
+        out.append({
+            "key": key,
+            "label": profile.get("label") or profile.get("name") or key,
+            "wifi": profile.get("wifi") or (profile.get("ssids") or [""])[0],
+            "name": profile.get("name") or key,
+            "is_current": key == current,
+        })
+    return out
+
+
+def find_scene(cfg, key):
+    for profile in cfg.get("profiles") or []:
+        if isinstance(profile, dict) and profile.get("key") == key:
+            return profile
+    return None
+
+
+def set_manual_scene(key):
+    """手动指定场景后，自动回退时优先用它。"""
+    state = load_state()
+    if key:
+        state["manual_scene"] = key
+    else:
+        state.pop("manual_scene", None)
+    save_state(state)
+
+
+def _remember_scene(key):
+    state = load_state()
+    state["last_scene"] = key
+    save_state(state)
+
+
+def switch_scene(cfg, log, key, connect_wifi=True):
+    """切到指定场景：连 Wi-Fi → 认证。返回 {"ok","code","scene","message"}。
+
+    这是「一键切换」的核心。连 Wi-Fi 失败就直接说明，不用浪费时间走认证。
+    """
+    profile = find_scene(cfg, key)
+    if not profile:
+        return {"ok": False, "code": -1, "scene": key, "message": "没有这个场景：%s" % key}
+
+    label = profile.get("label") or profile.get("name") or key
+    wifi = profile.get("wifi") or (profile.get("ssids") or [""])[0]
+
+    if connect_wifi and wifi:
+        log("切换到 %s：连接 Wi-Fi %s" % (label, wifi))
+        if not join_wifi(str(wifi), cfg):
+            return {"ok": False, "code": -1, "scene": key,
+                    "message": "连不上 Wi-Fi %s（可能不在范围内）" % wifi}
+        # 系统关联需要一点时间才生效
+        time.sleep(2)
+
+    # 只提交这一个场景的账号，不参与「依次试」，避免切到教室却用了宿舍的号
+    instance = InstanceLock()
+    if not instance.acquire():
+        return {"ok": False, "code": -1, "scene": key,
+                "message": "已有认证正在进行，请稍后再试"}
+    try:
+        code = _authenticate_scene_only(cfg, log, profile)
+    finally:
+        instance.release()
+
+    ok = code == 0
+    if ok:
+        _remember_scene(key)
+        log("已切到 %s（%s）" % (label, wifi))
+    return {"ok": ok, "code": code, "scene": key,
+            "message": "已连上 %s" % label if ok else "认证未成功（退出码 %s）" % code}
+
+
+def _authenticate_scene_only(cfg, log, profile):
+    """只用指定 profile 认证，不尝试其它配置。"""
+    timeout = float(cfg.get("request_timeout_seconds", 4))
+    login_timeout = float(cfg.get("login_timeout_seconds", 12))
+
+    reachable, _detail = connectivity_ok(cfg, timeout)
+    if reachable:
+        log("外网已通，不需要认证")
+        return 0
+
+    portal, info = find_portal(make_opener(), cfg, timeout)
+    if not portal:
+        log("未发现校园网门户（%s）" % info)
+        return 1
+
+    online, _detail, _uid = query_online(portal, cfg, timeout)
+    if online:
+        log("门户显示在线但外网不通，先注销再重新认证")
+        do_logout(portal, cfg, log)
+        time.sleep(2)
+
+    index = (cfg.get("profiles") or []).index(profile)
+    state, _detail = try_login_once(
+        cfg, log, portal, profile, index, timeout, login_timeout)
+    if state == "ok":
+        return 0
+    if state == "authfail":
+        return 2
+    return 1
 
 
 def authenticate(cfg, log, once=False, max_wait=None):
@@ -2159,6 +2318,24 @@ def do_logout(portal, cfg, log=None):
     return True, text
 
 
+def _scenes_command(cfg):
+    """输出场景列表 + 当前场景，给界面渲染切换按钮。"""
+    print(json.dumps({
+        "scenes": scenes(cfg),
+        "active": active_scene(cfg),
+        "manual": load_state().get("manual_scene") or "",
+    }, ensure_ascii=False, indent=2))
+    return 0
+
+
+def _switch_command(cfg, key, connect_wifi):
+    """切换场景并认证，结果以 JSON 输出。"""
+    log = Logger(cfg)
+    result = switch_scene(cfg, log, key, connect_wifi=connect_wifi)
+    print(json.dumps(result, ensure_ascii=False))
+    return 0 if result.get("ok") else 1
+
+
 def _config_command(cfg, flags):
     """输出界面能用的配置视图（不泄露密码明文）。"""
     stations = []
@@ -2274,6 +2451,19 @@ def main(argv):
         # 给界面用的：读当前配置，密码只给长度不给明文。
         # 前端只需要知道「填没填」，回填时用掩码占位，用户不改就不会覆盖。
         return _config_command(cfg, flags)
+
+    if command == "scenes":
+        # 界面主区按这个渲染场景切换按钮
+        return _scenes_command(cfg)
+
+    if command == "switch":
+        # switch <场景key> [--no-wifi]
+        keys = [a for a in args[1:] if not a.startswith("-")]
+        if not keys:
+            print(json.dumps({"ok": False, "message": "缺少场景名"},
+                             ensure_ascii=False))
+            return 1
+        return _switch_command(cfg, keys[0], "--no-wifi" not in flags)
 
     if command == "save":
         # 从 stdin 读 JSON 配置写盘（界面保存用）。密码传空串表示「保持原样」。
