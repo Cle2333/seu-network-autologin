@@ -181,8 +181,12 @@ const LOGIN_MESSAGES = {
 
 async function doLogin() {
   if (busy) return;
+  // 先占位再 await：get_status 要跑几秒，中间不占住 busy 的话
+  // 双击或托盘事件会并发起两个 login_once
+  busy = true;
   const status = await invoke('get_status').catch(() => null);
   if (status && !status.credentials) {
+    busy = false;
     switchView('viewSettings');
     return;
   }
@@ -356,14 +360,22 @@ async function pollOnce() {
 async function autoReconnectNow(s) {
   if (reconnecting) return;
   reconnecting = true;
+  // 整个重连过程都保持 UI 忙碌：一个场景最长 20-35 秒（连 Wi-Fi 等 20 秒 + 认证），
+  // 中途放开 busy 的话用户点按钮会和这里抢着切网络
+  setBusy(true);
   try {
     const ordered = sceneList.length
       ? [...sceneList].sort((a, b) =>
           (b.key === s.active_scene) - (a.key === s.active_scene))
       : [];
+    if (!ordered.length) {
+      setStatus('bad', '读不到场景配置', '去设置里重新保存一次');
+      return;
+    }
 
+    let tried = 0;
     for (const scene of ordered) {
-      setBusy(true);
+      tried += 1;
       setStatus('busy', '掉线了，正在重连', `尝试${scene.label}…`);
       try {
         const r = await invoke('switch_scene', { key: scene.key, connectWifi: true });
@@ -374,12 +386,11 @@ async function autoReconnectNow(s) {
         }
       } catch {
         /* 试下一个 */
-      } finally {
-        setBusy(false);
       }
     }
-    setStatus('bad', '重连失败', '两个场景都没连上，稍后再试');
+    setStatus('bad', '重连失败', `${tried} 个场景都没连上，稍后再试`);
   } finally {
+    setBusy(false);
     reconnecting = false;
   }
 }
