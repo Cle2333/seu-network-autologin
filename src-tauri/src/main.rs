@@ -18,16 +18,46 @@ use tauri::{
 };
 
 /// 调用 Python 脚本时用的解释器与脚本路径，启动时确定。
-/// 派生 Clone 是为了能拷进 spawn_blocking 里跑，不占主线程。
-#[derive(Clone)]
+/// 手动实现 clone_for_task() 以便拷进 spawn_blocking，不占主线程。
 struct Backend {
     python: String,
     script: PathBuf,
-    /// 数据目录（config.json / login.log 所在处），启动时问一次就缓存下来，
-    /// 避免读个日志还要额外跑一个 Python 进程。
-    data_dir: PathBuf,
+    /// 数据目录，第一次用到时算一次并缓存。用 Mutex 是因为要延迟初始化。
+    data_dir: std::sync::Mutex<Option<PathBuf>>,
     /// 脚本路径本身是否可用；不可用时每个命令都直接报这个错
     problem: Option<String>,
+}
+
+impl Backend {
+    /// 拿数据目录，首次调用时才去问 Python。
+    fn data_dir(&self) -> PathBuf {
+        let mut guard = match self.data_dir.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(dir) = guard.as_ref() {
+            return dir.clone();
+        }
+        let dir = resolve_data_dir(self);
+        *guard = Some(dir.clone());
+        dir
+    }
+
+    /// 这个方法让 Backend 能安全地 clone 进 spawn_blocking。
+    /// Mutex 不能 derive Clone，所以手写。
+    fn clone_for_task(&self) -> Backend {
+        let dir = self
+            .data_dir
+            .lock()
+            .ok()
+            .and_then(|g| g.clone());
+        Backend {
+            python: self.python.clone(),
+            script: self.script.clone(),
+            data_dir: std::sync::Mutex::new(dir),
+            problem: self.problem.clone(),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -96,29 +126,40 @@ fn locate_backend(app: &tauri::AppHandle) -> Backend {
         python = "python3".to_string();
     }
 
-    let mut backend = Backend {
+    Backend {
         python,
         script,
-        data_dir: PathBuf::new(),
+        data_dir: std::sync::Mutex::new(None),
         problem,
-    };
-    // 启动时问一次数据目录并缓存，省掉每次读日志都多起一个 Python
-    if backend.problem.is_none() {
-        let probe = run_backend(&backend, &["config", "--json"], None);
-        if let Ok(view) = serde_json::from_str::<serde_json::Value>(&probe.stdout) {
-            if let Some(dir) = view.get("data_dir").and_then(|d| d.as_str()) {
-                backend.data_dir = PathBuf::from(dir);
+    }
+}
+
+/// 数据目录（config.json / login.log 所在处）。
+///
+/// 不在 setup() 里探测：那时 Tauri 运行时刚初始化，同步 spawn 子进程会把
+/// 整个启动流程卡住（实测表现为界面空白、所有命令无响应）。
+/// 改成第一次用到时算一次并缓存进 state。
+fn resolve_data_dir(backend: &Backend) -> PathBuf {
+    if backend.problem.is_some() {
+        return backend
+            .script
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
+    }
+    let probe = run_backend(backend, &["config", "--json"], None);
+    if let Ok(view) = serde_json::from_str::<serde_json::Value>(&probe.stdout) {
+        if let Some(dir) = view.get("data_dir").and_then(|d| d.as_str()) {
+            if !dir.is_empty() {
+                return PathBuf::from(dir);
             }
-        }
-        if backend.data_dir.as_os_str().is_empty() {
-            backend.data_dir = backend
-                .script
-                .parent()
-                .map(|p| p.to_path_buf())
-                .unwrap_or_else(|| PathBuf::from("."));
         }
     }
     backend
+        .script
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 fn run_backend(backend: &Backend, args: &[&str], stdin: Option<&str>) -> CommandOutput {
@@ -180,7 +221,7 @@ where
     T: Send + 'static,
     F: FnOnce(Backend) -> Result<T, String> + Send + 'static,
 {
-    let backend = backend.clone();
+    let backend = backend.clone_for_task();
     tauri::async_runtime::spawn_blocking(move || job(backend))
         .await
         .map_err(|e| format!("后台任务异常：{e}"))?
@@ -293,7 +334,7 @@ async fn logout(state: tauri::State<'_, Backend>) -> Result<serde_json::Value, S
 #[tauri::command]
 fn read_log(state: tauri::State<'_, Backend>, lines: Option<usize>) -> String {
     let limit = lines.unwrap_or(120);
-    let dir = state.data_dir.clone();
+    let dir = state.data_dir();
     // 日志名可配，但默认 login.log；把最新的几份按顺序拼起来
     let mut names: Vec<String> = Vec::new();
     for index in (1..=3).rev() {
@@ -317,7 +358,7 @@ fn read_log(state: tauri::State<'_, Backend>, lines: Option<usize>) -> String {
 /// 打开配置文件夹（Finder / 资源管理器）。
 #[tauri::command]
 fn open_data_dir(state: tauri::State<'_, Backend>) -> Result<(), String> {
-    let dir = state.data_dir.to_string_lossy().to_string();
+    let dir = state.data_dir().to_string_lossy().to_string();
     if dir.is_empty() {
         return Err("拿不到数据目录".to_string());
     }
